@@ -45,5 +45,4 @@ services:
         value: '1'
       - key: PIP_PREFER_BINARY
         value: '1'
-    # Removed disk mount - use temporary directories for Render Free compatibility
-    healthCheckPath: /health
+
