@@ -24,7 +24,6 @@ services:
   - type: pserv
     name: chemfetch-ocr-lightweight
     env: python
-    pythonVersion: 3.11.9 # Your specified Python version for consistency
     # Simplified build command - prefer binary but allow fallback
     buildCommand: |
       cd ocr_service && 
