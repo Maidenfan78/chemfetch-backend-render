@@ -1,5 +1,5 @@
 # Ultra-lightweight requirements for Render Free (512MB limit)
-# Fixed PyMuPDF compilation issue with pre-built wheel
+# FIXED: Switched from PyMuPDF to pdfplumber to avoid C++ compilation issues
 
 # Build tools - MUST BE FIRST to ensure proper compilation
 wheel
@@ -11,10 +11,11 @@ flask-cors==4.0.0
 requests==2.31.0
 gunicorn==21.2.0  # Production WSGI server for Render
 
-# PDF text extraction - FIXED VERSION
-# Use specific stable PyMuPDF wheel that works on Render
-PyMuPDF==1.23.26  # Updated to more stable wheel version that compiles properly
-pdfminer.six==20231228  # Reliable fallback PDF extraction
+# PDF text extraction - RELIABLE PURE PYTHON SOLUTION
+# Using pdfplumber instead of PyMuPDF to avoid compilation issues
+pdfplumber==0.10.3  # Pure Python PDF processing - no C++ compilation needed!
+Pillow==9.5.0       # Image processing for pdfplumber
+pdfminer.six==20231228  # Fallback PDF extraction
 
 # Text processing and parsing
 python-dateutil==2.8.2  # Date parsing for SDS documents
@@ -23,12 +24,8 @@ regex==2024.5.15  # Pinned to avoid surprise upgrades
 # Utilities (minimal)
 numpy==1.24.4  # Required by some PDF processing
 
-# ALTERNATIVE PDF PROCESSING (uncomment if PyMuPDF still fails):
-# Comment out PyMuPDF above and uncomment these lines:
-# pdfplumber==0.10.3
-# Pillow==9.5.0
-
-# REMOVED FOR MEMORY OPTIMIZATION:
+# REMOVED PROBLEMATIC PACKAGES:
+# PyMuPDF - C++ compilation issues on Render
 # paddleocr - MAIN MEMORY HOG (300-400MB)
 # paddlepaddle - MAIN MEMORY HOG  
 # opencv-python - Heavy image processing (50-100MB)
@@ -38,4 +35,4 @@ numpy==1.24.4  # Required by some PDF processing
 # scikit-learn, pandas - Data science libraries
 # camelot-py, tabula-py - Table extraction libraries
 
-# TOTAL ESTIMATED MEMORY: ~100-150MB (vs 400-500MB with PaddleOCR)
+# TOTAL ESTIMATED MEMORY: ~80-120MB (much lighter without PyMuPDF compilation)
