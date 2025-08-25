@@ -1,5 +1,5 @@
 # Ultra-lightweight requirements for Render Free (512MB limit)
-# FIXED: Switched from PyMuPDF to pdfplumber to avoid C++ compilation issues
+# FIXED: Resolved pdfplumber/pdfminer.six version conflict
 
 # Build tools - MUST BE FIRST to ensure proper compilation
 wheel
@@ -11,11 +11,11 @@ flask-cors==4.0.0
 requests==2.31.0
 gunicorn==21.2.0  # Production WSGI server for Render
 
-# PDF text extraction - RELIABLE PURE PYTHON SOLUTION
+# PDF text extraction - COMPATIBLE VERSIONS
 # Using pdfplumber instead of PyMuPDF to avoid compilation issues
 pdfplumber==0.10.3  # Pure Python PDF processing - no C++ compilation needed!
+pdfminer.six==20221105  # Version compatible with pdfplumber 0.10.3
 Pillow==9.5.0       # Image processing for pdfplumber
-pdfminer.six==20231228  # Fallback PDF extraction
 
 # Text processing and parsing
 python-dateutil==2.8.2  # Date parsing for SDS documents
