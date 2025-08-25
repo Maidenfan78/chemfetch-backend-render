@@ -19,11 +19,11 @@ services:
     name: chemfetch-ocr-lightweight
     env: python
     pythonVersion: 3.11.9 # Your specified Python version for consistency
-    # Enhanced build command - force binary wheels to avoid compilation
+    # Simplified build command - prefer binary but allow fallback
     buildCommand: |
       cd ocr_service && 
       pip install --upgrade pip &&
-      pip install --only-binary=all --no-build-isolation --no-cache-dir -r requirements.txt
+      pip install --prefer-binary --no-cache-dir -r requirements.txt
     startCommand: cd ocr_service && gunicorn ocr_service:app --workers=1 --threads=2 --timeout=120 --preload=false -b 0.0.0.0:5001
     plan: free # Now fits within 512MB limit!
     envVars:
@@ -35,12 +35,10 @@ services:
         value: '1'
       - key: DEBUG_IMAGES
         value: '0'
-      # Additional build optimization environment variables
+      # Build optimization environment variables
       - key: PIP_NO_CACHE_DIR
         value: '1'
-      - key: PIP_ONLY_BINARY
-        value: ':all:'
-      - key: PIP_NO_BUILD_ISOLATION
+      - key: PIP_PREFER_BINARY
         value: '1'
     # Removed disk mount - use temporary directories for Render Free compatibility
     healthCheckPath: /health
