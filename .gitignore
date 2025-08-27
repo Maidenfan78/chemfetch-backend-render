@@ -4,6 +4,7 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+dist/
 
 # Logs
 logs/
@@ -23,6 +24,8 @@ __pycache__/
 env/
 venv/
 
+dist/
+
 # Temporary files
 *.tmp
 *.swp
@@ -35,3 +38,5 @@ ocr_service/*.png
 
 # VSCode
 .vscode/
+
+
