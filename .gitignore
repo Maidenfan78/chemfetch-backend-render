@@ -24,8 +24,6 @@ __pycache__/
 env/
 venv/
 
-dist/
-
 # Temporary files
 *.tmp
 *.swp
@@ -38,5 +36,3 @@ ocr_service/*.png
 
 # VSCode
 .vscode/
-
-
