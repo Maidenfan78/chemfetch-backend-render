@@ -2,7 +2,7 @@ import re
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import logging
 
 # Configure logging for this module
@@ -61,13 +61,32 @@ FIELD_LABELS = {
     'packing_group': [r'Packing group', r'PG', r'.*packing group', r'Australian Dangerous Goods packing group'],
 }
 
+# Additional keywords that frequently appear after labels but are not part of the field value
+CONTACT_LABELS = [
+    r'Telephone', r'Tel', r'Phone', r'Fax', r'E[-]?mail', r'Website',
+    r'Emergency', r'Address', r'Poison', r'Product code'
+]
+
 # Flattened list of all label regexes for filtering
-ALL_LABELS = [lab for labs in FIELD_LABELS.values() for lab in labs] + ['SDS no.', 'SDS number']
+ALL_LABELS = [lab for labs in FIELD_LABELS.values() for lab in labs] + ['SDS no.', 'SDS number'] + CONTACT_LABELS
+
+# Precompiled regex for detecting labels within values
+LABEL_SPLIT_RE = re.compile(r"\b(?:" + "|".join(ALL_LABELS) + r")\b", re.IGNORECASE)
+
+# Minimum text length before triggering OCR fallback
+MIN_TEXT_LENGTH = 50
 
 
-def extract_text(path: Path) -> str:
-    """Extract text from PDF with multiple fallback methods for 512MB limit"""
+def extract_text(path: Path) -> Tuple[str, Optional[str]]:
+    """Extract text from PDF with multiple fallback methods and improved OCR triggering.
+
+    Returns a tuple of the extracted text and an optional OCR error message.
+    """
     logger.info(f"[SDS_EXTRACTOR] Starting text extraction from: {path}")
+
+    best_text = ""
+    extraction_method = None
+    ocr_error: Optional[str] = None
     
     # Method 1: PyMuPDF (if available - fastest)
     if PYMUPDF_AVAILABLE:
@@ -81,14 +100,14 @@ def extract_text(path: Path) -> str:
                 page_text = page.get_text()
                 text += page_text
                 if i == 0:  # Log first page for debugging
-                    logger.info(f"[SDS_EXTRACTOR] First page extracted {len(page_text)} chars")
+                    logger.info(f"[SDS_EXTRACTOR] PyMuPDF page 1: {len(page_text)} chars")
             
             doc.close()
             logger.info(f"[SDS_EXTRACTOR] PyMuPDF extracted {len(text)} characters total")
             
-            if text.strip():
-                logger.info("[SDS_EXTRACTOR] PyMuPDF extraction successful")
-                return text
+            if len(text.strip()) > len(best_text.strip()):
+                best_text = text
+                extraction_method = "PyMuPDF"
                 
         except Exception as e:
             logger.error(f"[SDS_EXTRACTOR] PyMuPDF extraction failed: {e}")
@@ -103,12 +122,13 @@ def extract_text(path: Path) -> str:
                     page_text = page.extract_text() or ""
                     text += page_text
                     if i == 0:
-                        logger.info(f"[SDS_EXTRACTOR] First page extracted {len(page_text)} chars")
+                        logger.info(f"[SDS_EXTRACTOR] pdfplumber page 1: {len(page_text)} chars")
             
             logger.info(f"[SDS_EXTRACTOR] pdfplumber extracted {len(text)} characters total")
-            if text.strip():
-                logger.info("[SDS_EXTRACTOR] pdfplumber extraction successful")
-                return text
+            
+            if len(text.strip()) > len(best_text.strip()):
+                best_text = text
+                extraction_method = "pdfplumber"
                 
         except Exception as e:
             logger.error(f"[SDS_EXTRACTOR] pdfplumber extraction failed: {e}")
@@ -121,40 +141,69 @@ def extract_text(path: Path) -> str:
                 text = pdfminer_extract(f)
             
             logger.info(f"[SDS_EXTRACTOR] pdfminer.six extracted {len(text)} characters")
-            if text.strip():
-                logger.info("[SDS_EXTRACTOR] pdfminer.six extraction successful")
-                return text
+            
+            if len(text.strip()) > len(best_text.strip()):
+                best_text = text
+                extraction_method = "pdfminer.six"
                 
         except Exception as e:
             logger.error(f"[SDS_EXTRACTOR] pdfminer.six extraction failed: {e}")
     
-    # Method 4: OCR fallback (if available and other methods failed)
-    if OCR_AVAILABLE:
+    # Check if we need OCR (insufficient text from all methods)
+    text_length = len(best_text.strip())
+    logger.info(f"[SDS_EXTRACTOR] Best text extraction: {text_length} chars using {extraction_method}")
+
+    # Method 4: OCR fallback (if text is insufficient AND OCR is available)
+    if text_length < MIN_TEXT_LENGTH and OCR_AVAILABLE:
+        logger.warning(f"[SDS_EXTRACTOR] Text too short ({text_length} chars), falling back to OCR...")
+        logger.info("[SDS_EXTRACTOR] Converting PDF to images for OCR...")
         try:
-            logger.warning("[SDS_EXTRACTOR] All text methods failed, falling back to OCR...")
-            images = convert_from_path(str(path), dpi=200, first_page=1, last_page=10)
+            images = convert_from_path(str(path), dpi=300, first_page=1, last_page=10)
             logger.info(f"[SDS_EXTRACTOR] Converted to {len(images)} images for OCR")
-            
-            ocr_text = ""
-            for i, img in enumerate(images):
-                try:
-                    page_text = pytesseract.image_to_string(img, config='--psm 1')
-                    ocr_text += f"\n--- Page {i+1} ---\n{page_text}"
-                    logger.info(f"[SDS_EXTRACTOR] OCR page {i+1}: {len(page_text)} chars")
-                except Exception as page_error:
-                    logger.warning(f"[SDS_EXTRACTOR] OCR failed for page {i+1}: {page_error}")
-                    continue
-            
-            logger.info(f"[SDS_EXTRACTOR] OCR extracted {len(ocr_text)} characters total")
-            if ocr_text.strip():
-                return ocr_text
-                
         except Exception as e:
-            logger.error(f"[SDS_EXTRACTOR] OCR extraction failed: {e}")
-    
-    # All methods failed
-    logger.error("[SDS_EXTRACTOR] All text extraction methods failed")
-    return ""
+            ocr_error = f"convert_from_path failed: {e}"
+            logger.exception(f"[SDS_EXTRACTOR] {ocr_error}")
+            return best_text, ocr_error
+
+        ocr_text = ""
+        page_errors = []
+        for i, img in enumerate(images):
+            try:
+                logger.info(f"[SDS_EXTRACTOR] Running OCR on page {i+1}...")
+                page_text = pytesseract.image_to_string(img, config='--psm 1 -l eng')
+                ocr_text += f"\n--- Page {i+1} ---\n{page_text}"
+                logger.info(f"[SDS_EXTRACTOR] OCR page {i+1}: {len(page_text)} chars extracted")
+                if page_text.strip():
+                    sample = page_text.strip()[:100].replace('\n', ' ')
+                    logger.info(f"[SDS_EXTRACTOR] OCR page {i+1} sample: '{sample}...'")
+            except Exception as page_error:
+                err = f"pytesseract failed for page {i+1}: {page_error}"
+                logger.exception(f"[SDS_EXTRACTOR] {err}")
+                page_errors.append(err)
+                continue
+
+        logger.info(f"[SDS_EXTRACTOR] OCR extracted {len(ocr_text)} characters total")
+
+        if ocr_text.strip():
+            logger.info(f"[SDS_EXTRACTOR] OCR successful! Using OCR text ({len(ocr_text)} chars)")
+            return ocr_text, None
+
+        ocr_error = "; ".join(page_errors) if page_errors else "OCR produced no text"
+        logger.error(f"[SDS_EXTRACTOR] {ocr_error}")
+
+    elif text_length < MIN_TEXT_LENGTH and not OCR_AVAILABLE:
+        ocr_error = "OCR not available"
+        logger.error(f"[SDS_EXTRACTOR] Insufficient text ({text_length} chars) and OCR not available")
+    else:
+        logger.info(f"[SDS_EXTRACTOR] Sufficient text extracted ({text_length} chars), no OCR needed")
+
+    if not best_text.strip():
+        err_msg = ocr_error or "All text extraction methods failed"
+        logger.error(f"[SDS_EXTRACTOR] {err_msg}")
+        return "", ocr_error
+
+    logger.info(f"[SDS_EXTRACTOR] Final text: {len(best_text)} chars using {extraction_method}")
+    return best_text, ocr_error
 
 
 def get_section(text: str, number: int) -> str:
@@ -178,33 +227,45 @@ def get_section(text: str, number: int) -> str:
 
 
 def extract_after_label(section_text: str, labels):
-    """Extract value after finding a matching label"""
+    """Extract value that follows a label from Section text."""
     lines = section_text.splitlines()
-    
+
     for i, line in enumerate(lines):
         clean = line.strip()
         if not clean:
             continue
-            
-        label_part = clean.split(':', 1)[0]
-        
+
         for label in labels:
-            if re.fullmatch(label, label_part, re.IGNORECASE):
-                # Try same line after colon
-                if ':' in clean:
-                    after = clean.split(':', 1)[1].strip()
-                    if after and not any(re.fullmatch(lab, after, re.IGNORECASE) for lab in ALL_LABELS):
-                        return after
-                
-                # Look at subsequent lines for value
+            # Case 1: label and value on same line (colon/dash optional)
+            same = re.search(rf"^{label}\b\s*(?:[:\-]\s*)?(.+)", clean, re.IGNORECASE)
+            if same:
+                value = same.group(1).strip()
+                # Truncate at appearance of other labels/contact keywords
+                trunc = LABEL_SPLIT_RE.search(value)
+                if trunc:
+                    value = value[:trunc.start()].strip()
+                if value:
+                    return value
+
+            # Case 2: label alone on this line, value on next lines
+            if re.fullmatch(label, clean, re.IGNORECASE):
                 j = i + 1
                 while j < len(lines):
                     candidate = lines[j].strip()
-                    if candidate and not candidate.startswith(':') and not re.match(r'^[:\-]+$', candidate):
-                        if not any(re.fullmatch(lab, candidate, re.IGNORECASE) for lab in ALL_LABELS):
+                    if not candidate:
+                        j += 1
+                        continue
+                    # Handle value on separate line prefixed by a colon
+                    if candidate.startswith(':'):
+                        candidate = candidate[1:].strip()
+                        if candidate and not LABEL_SPLIT_RE.search(candidate):
                             return candidate
+                        j += 1
+                        continue
+                    if not LABEL_SPLIT_RE.search(candidate):
+                        return candidate
                     j += 1
-    
+
     return None
 
 
@@ -241,7 +302,7 @@ def extract_section14_field(sec14: str, labels, value_pattern):
 def parse_pdf(path: Path) -> Dict[str, Any]:
     """
     Parse SDS PDF and extract key information.
-    Enhanced for lightweight deployment with graceful degradation.
+    Enhanced for lightweight deployment with graceful degradation and improved OCR fallback.
     
     Args:
         path: Path to the PDF file
@@ -250,28 +311,50 @@ def parse_pdf(path: Path) -> Dict[str, Any]:
         Dictionary with extracted SDS data
     """
     logger.info(f"[SDS_EXTRACTOR] Starting PDF parsing: {path}")
+    logger.info(f"[SDS_EXTRACTOR] File size: {path.stat().st_size / (1024*1024):.2f} MB")
     logger.info(f"[SDS_EXTRACTOR] Available extraction methods: PyMuPDF={PYMUPDF_AVAILABLE}, pdfplumber={PDFPLUMBER_AVAILABLE}, OCR={OCR_AVAILABLE}")
     
     # Step 1: Extract text
     logger.info("[SDS_EXTRACTOR] Step 1: Extracting text from PDF...")
     try:
-        text = extract_text(path)
-        logger.info(f"[SDS_EXTRACTOR] Text extraction complete, total length: {len(text)}")
-        
-        if len(text) < 100:
-            logger.warning(f"[SDS_EXTRACTOR] Very short text extracted ({len(text)} chars)")
+        text, ocr_error = extract_text(path)
+        text_length = len(text.strip())
+        logger.info(f"[SDS_EXTRACTOR] Text extraction complete, total length: {text_length}")
+
+        if text_length == 0:
+            logger.error("[SDS_EXTRACTOR] No text extracted from PDF")
             return {
-                "error": "Insufficient text extracted from PDF",
-                "text_length": len(text),
+                "error": ocr_error or "No text extracted from PDF",
+                "text_length": text_length,
                 "available_methods": {
                     "pymupdf": PYMUPDF_AVAILABLE,
-                    "pdfplumber": PDFPLUMBER_AVAILABLE, 
+                    "pdfplumber": PDFPLUMBER_AVAILABLE,
                     "ocr": OCR_AVAILABLE
                 },
-                "extraction_mode": "text-only" if not OCR_AVAILABLE else "full"
+                "extraction_mode": "text-only" if not OCR_AVAILABLE else "full",
+                "debug_info": ocr_error or ""
+            }
+
+        # Enhanced debugging for short text
+        if text_length < 100:
+            logger.warning(f"[SDS_EXTRACTOR] Very short text extracted ({text_length} chars)")
+            logger.info(f"[SDS_EXTRACTOR] Text sample: '{text.strip()[:200]}'")
+            return {
+                "error": "Insufficient text extracted from PDF",
+                "text_length": text_length,
+                "text_sample": text.strip()[:200] if text.strip() else "",
+                "available_methods": {
+                    "pymupdf": PYMUPDF_AVAILABLE,
+                    "pdfplumber": PDFPLUMBER_AVAILABLE,
+                    "ocr": OCR_AVAILABLE
+                },
+                "extraction_mode": "text-only" if not OCR_AVAILABLE else "full",
+                "debug_info": ocr_error or "OCR produced too little text"
             }
     except Exception as e:
         logger.error(f"[SDS_EXTRACTOR] Text extraction failed: {e}")
+        import traceback
+        logger.error(f"[SDS_EXTRACTOR] Extraction traceback: {traceback.format_exc()}")
         return {
             "error": f"Text extraction failed: {e}",
             "available_methods": {
@@ -328,8 +411,8 @@ def parse_pdf(path: Path) -> Dict[str, Any]:
     # Manufacturer
     manufacturer = extract_after_label(sec1, FIELD_LABELS['manufacturer'])
     if not manufacturer:
-        # Try alternative pattern
-        m = re.search(r'Details of the supplier[^\n]*\n([^\n]+)', sec1, re.IGNORECASE)
+        # Try alternative pattern grabbing first non-empty line after heading
+        m = re.search(r'Details of the supplier[^\n]*\n\s*([^\n]+)', sec1, re.IGNORECASE)
         if m:
             manufacturer = m.group(1).strip()
     result['manufacturer'] = {'value': manufacturer, 'confidence': 1.0 if manufacturer else 0.0}
@@ -409,7 +492,7 @@ if __name__ == '__main__':
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python sds_extractor.py <pdf_file> [pdf_file2] ...")
+        print("Usage: python sds_extractor.py <pdf_file> [pdf_file2] ...]")
         sys.exit(1)
     
     for pdf_path in sys.argv[1:]:
