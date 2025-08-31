@@ -3,12 +3,75 @@
 SDS Parser Test Script for ChemFetch
 Simple script to test SDS parser with local PDF files.
 """
-
 import subprocess
 import sys
 from pathlib import Path
 import json
-
+from datetime import datetime
+def format_results_as_text(results: dict, pdf_files: list, total_fields: int) -> str:
+    """Format test results as readable text output."""
+    
+    # Header
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    text_output = f"""🧪 ChemFetch SDS Parser Test Results
+{'=' * 50}
+Generated: {timestamp}
+Total Files Tested: {len(pdf_files)}
+"""
+    
+    # Individual file results
+    for i, (filename, result) in enumerate(results.items(), 1):
+        text_output += f"[{i}/{len(pdf_files)}] {filename}\n"
+        text_output += "-" * 40 + "\n"
+        
+        if result.get('success'):
+            # Show extracted fields
+            extracted_values = result.get('extracted_values', {})
+            found = result.get('fields_extracted', 0)
+            
+            for field in ['product_name', 'manufacturer', 'description', 'issue_date', 'dangerous_goods_class', 'packing_group']:
+                field_data = extracted_values.get(field, {})
+                value = field_data.get('value')
+                if value is not None:
+                    text_output += f"✅ {field}: {value}\n"
+                else:
+                    text_output += f"⚠️ {field}: None\n"
+            
+            text_output += f"📊 Extracted {found}/{total_fields} key fields\n"
+            
+            # Show file size
+            file_size = result.get('file_size_mb', 0)
+            text_output += f"📁 File size: {file_size} MB\n"
+            
+        else:
+            # Show error
+            error = result.get('error', 'Unknown error')
+            text_output += f"❌ Failed: {error}\n"
+            
+            if 'return_code' in result:
+                text_output += f"🔢 Return code: {result['return_code']}\n"
+        
+        text_output += "\n"
+    
+    # Summary
+    successful = sum(1 for r in results.values() if r.get('success'))
+    failed = sum(1 for r in results.values() if not r.get('success'))
+    
+    text_output += f"📊 **SUMMARY**\n"
+    text_output += f"✅ Successful: {successful}\n"
+    text_output += f"❌ Failed: {failed}\n"
+    text_output += f"📄 Total: {len(pdf_files)}\n"
+    
+    if successful > 0:
+        avg_fields = (
+            sum(r.get('fields_extracted', 0) for r in results.values() if r.get('success'))
+            / successful
+        )
+        text_output += f"📈 Avg fields: {avg_fields:.1f}/{total_fields}\n"
+    
+    text_output += f"\n🎉 Testing complete!\n"
+    
+    return text_output
 def main():
     """Test SDS parser with PDFs in test-data/sds-pdfs directory."""
     
@@ -30,17 +93,45 @@ def main():
         print(f"📁 Creating: {test_dir}")
         test_dir.mkdir(parents=True, exist_ok=True)
     
-    # Find PDF files
-    pdf_files = list(test_dir.glob("*.pdf"))
+    # Find PDF files (case-insensitive) and avoid duplicates across platforms
+    # Using a single glob with character class prevents duplicates on Windows
+    # where globbing is already case-insensitive, and still matches both cases
+    # on case-sensitive filesystems.
+    pdf_files = list(test_dir.glob('*.[Pp][Dd][Ff]'))
+    
+    # Sort PDFs numerically by extracting numbers from filenames
+    def extract_number_from_filename(path):
+        """Extract number from filename for sorting (e.g., 'sds1.pdf' -> 1)."""
+        import re
+        match = re.search(r'(\d+)', path.stem)
+        return int(match.group(1)) if match else float('inf')  # Put non-numbered files at end
+    
+    pdf_files.sort(key=extract_number_from_filename)
     
     if not pdf_files:
         print(f"❌ No PDF files in: {test_dir}")
         print("📋 Copy your SDS PDFs to test-data/sds-pdfs/ and run again")
         return 0
     
-    print(f"📄 Found {len(pdf_files)} PDF files")
+    print(f"📄 Found {len(pdf_files)} PDF files (sorted numerically)")
     
-    # Test each PDF and collect results
+    # Show the order they'll be processed in
+    if len(pdf_files) <= 10:  # Only show list if reasonable number
+        print("📋 Processing order:")
+        for i, pdf_file in enumerate(pdf_files, 1):
+            print(f"  {i:2d}. {pdf_file.name}")
+    else:
+        print(f"📋 Processing {pdf_files[0].name} to {pdf_files[-1].name}...")
+    # Define fields to extract and prepare results container
+    fields = [
+        "product_name",
+        "manufacturer",
+        "description",
+        "issue_date",
+        "dangerous_goods_class",
+        "packing_group",
+    ]
+    total_fields = len(fields)
     results = {}
     
     for i, pdf_path in enumerate(pdf_files, 1):
@@ -73,31 +164,34 @@ def main():
                         # Fallback: try parsing the whole output
                         data = json.loads(result.stdout)
                     # Show key extracted fields
-                    fields = ['product_name', 'manufacturer', 'issue_date', 'dangerous_goods_class']
                     found = 0
                     extracted_values = {}
-                    
                     for field in fields:
-                        field_data = data.get(field, {})
+                        field_data = data.get(field)
+                        value = None
+                        confidence = 0
                         if isinstance(field_data, dict):
-                            value = field_data.get('value')
-                            confidence = field_data.get('confidence', 0)
-                            if value:
-                                print(f"✅ {field}: {value}")
-                                found += 1
-                                extracted_values[field] = {'value': value, 'confidence': confidence}
-                        elif field_data:
-                            print(f"✅ {field}: {field_data}")
+                            value = field_data.get("value")
+                            confidence = field_data.get("confidence", 0)
+                        elif field_data is not None:
+                            value = field_data
+                            confidence = 1.0
+                        if value is not None:
+                            print(f"✅ {field}: {value}")
                             found += 1
-                            extracted_values[field] = {'value': field_data, 'confidence': 1.0}
-                    
-                    print(f"📊 Extracted {found}/{len(fields)} key fields")
+                        else:
+                            print(f"⚠️ {field}: None")
+                        extracted_values[field] = {
+                            "value": value,
+                            "confidence": confidence,
+                        }
+                    print(f"📊 Extracted {found}/{total_fields} key fields")
                     
                     # Store successful result
                     results[pdf_path.name] = {
                         'success': True,
                         'fields_extracted': found,
-                        'total_fields': len(fields),
+                        'total_fields': total_fields,
                         'extracted_values': extracted_values,
                         'full_data': data,
                         'file_size_mb': round(pdf_path.stat().st_size / (1024 * 1024), 2)
@@ -140,23 +234,34 @@ def main():
     
     # Save results to JSON file
     results_file = script_dir / "test-data" / "sds_test_results.json"
+    text_results_file = script_dir / "test-data" / "sds_test_results.txt"
+    
     try:
+        # Save JSON results
         with open(results_file, 'w', encoding='utf-8') as f:
             json.dump({
-                'test_timestamp': str(Path(__file__).stat().st_mtime),
+                'test_timestamp': datetime.now().isoformat(),
                 'total_files': len(pdf_files),
                 'successful': sum(1 for r in results.values() if r.get('success')),
                 'failed': sum(1 for r in results.values() if not r.get('success')),
                 'results': results
             }, f, indent=2, ensure_ascii=False, default=str)
         
-        print(f"\n💾 Results saved to: {results_file}")
+        print(f"\n💾 JSON results saved to: {results_file}")
+        
+        # Save text results
+        text_content = format_results_as_text(results, pdf_files, total_fields)
+        with open(text_results_file, 'w', encoding='utf-8') as f:
+            f.write(text_content)
+        
+        print(f"📝 Text results saved to: {text_results_file}")
+        
     except Exception as e:
         print(f"❌ Failed to save results: {e}")
     
     # Summary
     successful = sum(1 for r in results.values() if r.get('success'))
-    failed = len(pdf_files) - successful
+    failed = sum(1 for r in results.values() if not r.get('success'))
     
     print(f"\n📊 **SUMMARY**")
     print(f"✅ Successful: {successful}")
@@ -164,10 +269,12 @@ def main():
     print(f"📄 Total: {len(pdf_files)}")
     
     if successful > 0:
-        avg_fields = sum(r.get('fields_extracted', 0) for r in results.values() if r.get('success')) / successful
-        print(f"📈 Avg fields: {avg_fields:.1f}/4")
+        avg_fields = (
+            sum(r.get('fields_extracted', 0) for r in results.values() if r.get('success'))
+            / successful
+        )
+        print(f"📈 Avg fields: {avg_fields:.1f}/{total_fields}")
     
     print(f"\n🎉 Testing complete!")
-
 if __name__ == '__main__':
     sys.exit(main())
