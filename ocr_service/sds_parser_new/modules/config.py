@@ -7,19 +7,31 @@ import re
 SECTION_PATTERN = re.compile(r'^\s*(?:section\s*)?(\d{1,2})(?:\s|:|\.)(?=\s)', re.IGNORECASE | re.MULTILINE)
 
 DATE_PATTERN = re.compile(
-    r'(\b(?:Revision(?: Date)?|Issue Date|Date of issue|Version date|SDS creation date|Date Prepared|Issued)[^\n]{0,40})\s*[:]?\s*(?:\nPage[^\n]*\n)?\s*'
-    r'((?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4})|(?:[A-Za-z]+\s+\d{1,2},?\s*\d{4})|(?:\d{4}-\d{2}-\d{2}))',
+    r'(\b(?:Revision(?:\s*Date)?|Issue\s*Date|Date\s*of\s*issue|Version\s*date|SDS\s*creation\s*date|SDS\s*date|Date\s*Prepared|Prepared\s*on|Prepared|Issued|Printed\s*on|Print\s*date|Printing\s*date)[^\n]{0,40})\s*[:]?\s*(?:\nPage[^\n]*\n)?\s*'
+    r'('
+    r'(?:\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})'                         # 01/09/2022 or 09-01-22
+    r'|(?:\d{4}-\d{2}-\d{2})'                                          # 2022-09-01
+    r'|(?:[A-Za-z]+\.?\s+\d{1,2},?\s*\d{4})'                          # Sep 1, 2022 / September 1 2022
+    r'|(?:\d{1,2}\s+[A-Za-z]+\.?\s+\d{4})'                            # 1 Sep 2022
+    r'|(?:\d{1,2}[\-\/.][A-Za-z]{3,}\.?[\-\/.]\d{2,4})'             # 08-Sep-2022 or 08.Sep.22
+    r')',
     re.IGNORECASE)
 
 # Improved field label patterns - more specific and comprehensive
 FIELD_LABELS = {
     'product_name': [
-        r'Product\s+identifier',
-        r'Product\s+Name',
+        # Prefer explicit trade/product name labels over generic identifier
         r'Trade\s+name',
-        r'Product\s+code',
+        r'Handelsname',
+        r'Product\s+Name',
+        r'Product\s+Identifier',
+        r'Product\s+Ident\W*fier',
+        r'GHS\s+product\s+identifier',
+        r'GHS\s+product\s+ident\W*fier',
+        r'Product\s+identifier',
         r'Commercial\s+product\s+name',
-        r'Product\s+designation'
+        r'Product\s+designation',
+        # NOTE: Do NOT include product code here to avoid mis-capturing numeric codes as names
     ],
     'manufacturer': [
         r'Manufacturer',
@@ -31,16 +43,30 @@ FIELD_LABELS = {
         r'Company\s+name',
         r'Registered\s+company\s+name',
         r'Distributor',
-        r'Manufacturer\s*/\s*Supplier'
+        r'Manufacturer\s*/\s*Supplier',
+        # German variants
+        r'Hersteller',
+        r'Lieferant',
+        r'Hersteller\s*/\s*Lieferant',
+        r'Inverkehrbringer',
     ],
     'product_use': [
         r'Recommended\s+use',
         r'Intended\s+use',
         r'Use\s+of\s+the\s+substance',
+        r'Use\s*\(s\)',
+        r'Use\b',
         r'Product\s+use',
         r'Relevant\s+identified\s+uses',
         r'Identified\s+uses',
-        r'Uses\s+advised\s+against'
+        r'Uses\s+advised\s+against',
+        # German variants
+        r'Verwendung',
+        r'Verwendungszweck',
+        r'Anwendung',
+        r'Anwendungszweck',
+        r'Empfohlene\s+Verwendung',
+        r'Verwendung\s+des\s+Stoffs(?:\s*/\s*der\s*Mischung)?',
     ],
     'dangerous_goods_class': [
         r'DG\s+Class',
@@ -49,7 +75,11 @@ FIELD_LABELS = {
         r'(?:IMDG|IATA|ADG)?\s*Hazard\s+Class',
         r'Australian\s+Dangerous\s+Goods\s+class',
         r'Dangerous\s+goods\s+class',
-        r'UN\s+Class'
+        r'UN\s+Class',
+        # German variants
+        r'Gefahrklasse',
+        r'Transportklasse',
+        r'Klasse',
     ],
     'subsidiary_risk': [
         r'Subsidiary\s+risk',
@@ -60,7 +90,10 @@ FIELD_LABELS = {
         r'Packing\s+group',
         r'PG',
         r'.*packing\s+group',
-        r'Australian\s+Dangerous\s+Goods\s+packing\s+group'
+        r'Australian\s+Dangerous\s+Goods\s+packing\s+group',
+        # German variants
+        r'Verpackungsgruppe',
+        r'Verpackungsgruppe\s*\(falls\s*zutreffend\)'
     ],
 }
 
@@ -75,6 +108,32 @@ NOISE_LABELS = [
     r'Safety\s+data\s+sheet', r'Document\s+number', r'\d{2,4}\s+\d{2,4}\s+\d{2,4}',
     r'Document\s+type', r'Country', r'Language', r'Format'
 ]
+
+# Treat raw label words as noise values to avoid capturing labels as field values
+# This helps when PDFs render labels twice or on separate columns, e.g., "Manufacturer: Manufacturer"
+NOISE_LABELS.extend([
+    r'Manufacturer',
+    r'Supplier',
+    r'Supplier\s+Name',
+    r'Company\s+name(?:\s+of\s+supplier)?',
+    r'Producer',
+    r'Distributor',
+    # German label words as noise values
+    r'Hersteller',
+    r'Lieferant',
+    r'Hersteller\s*/\s*Lieferant',
+    r'Verwendung',
+    r'Verwendungszweck',
+    r'Anwendung',
+    r'Empfohlene\s+Verwendung',
+    r'Gefahrklasse',
+    r'Verpackungsgruppe',
+    r'Notrufnummer',
+    r'E[-]?Mail',
+    r'Telefon',
+    r'Telefax',
+    r'Adresse',
+])
 
 # Valid dangerous goods classes (1-9 with possible subdivisions)
 VALID_DG_CLASSES = re.compile(r'^[1-9](?:\.[1-9])?$')

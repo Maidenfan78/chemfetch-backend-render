@@ -24,12 +24,15 @@ sds_parser_new/
     ├── field_extractor.py# Field-level parsing (CAS, DG class, etc.)
     ├── date_parser.py   # Date normalization helpers
     ├── dependencies.py  # Optional deps and guards
-    └── utils.py         # Utilities and confidence helpers
+    └── utils.py         # Utilities and confidence helpers (incl. doubled-label cleanup)
 
 Root-level (in ocr_service/):
 ├── parse_sds.py         # CLI/unified parser wrapper
 ├── quick_parser.py      # Lightweight regex-based fallback
 └── ocr_service.py       # Flask app using this module
+
+Additional developer helpers:
+- `ocr_service/dump_text.py` – small utility to dump PDF text (pdfplumber/pdfminer) for debugging parser behavior.
 ```
 
 ## Parsing Strategy (Layered Approach)
@@ -109,6 +112,25 @@ for image in images:
     text = pytesseract.image_to_string(image)
 ```
 
+Fallback without Poppler (uses PyMuPDF + Pillow):
+
+```python
+import fitz  # PyMuPDF
+from PIL import Image
+import pytesseract
+
+doc = fitz.open(pdf_path)
+mat = fitz.Matrix(2, 2)  # ~200 DPI
+parts = []
+for page in doc:
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    mode = 'RGB' if pix.n >= 3 else 'L'
+    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+    img = img.convert('L') if mode != 'L' else img
+    parts.append(pytesseract.image_to_string(img))
+text = '\n'.join(parts)
+```
+
 ## Pattern Matching & Regex
 
 ### Chemical Identification Patterns
@@ -138,7 +160,7 @@ precaution_pattern = r'\bP[1-5]\d{2}\b'
 def extract_sections(text):
     sections = {}
     section_patterns = {
-        'identification': r'section\s+1[:\.\s]*identification',
+        'identification': r'^(?:section\s*)?1\s*[:\.-]?\s',  # relaxed for OCR
         'hazards': r'section\s+2[:\.\s]*hazard',
         'composition': r'section\s+3[:\.\s]*composition',
         # ... additional sections
@@ -185,6 +207,13 @@ test_files = [
 ]
 ```
 
+## Recent Updates
+
+- Section detection: tolerates leading bullets/symbols before headers (e.g., "\* SECTION 1").
+- Manufacturer/Description: added German labels (Hersteller, Lieferant, Verwendung, Anwendung, Verpackungsgruppe, Gefahrklasse) and improved near-label scanning that avoids codes (SU/PROC) and prefers lines with nearby contact info.
+- Description prioritization: prefer Application/Use lines over filler like "No further relevant information available.".
+- Dangerous goods class: extended windowed scanning and context-based upgrade to prefer subclasses (e.g., 2.1) when a bare class was initially found.
+
 ## Common SDS Formats & Variations
 
 - **Standard GHS Format**: 16-section internationally standardized format
@@ -196,6 +225,13 @@ test_files = [
 ## Improvement Strategies
 
 ### Accuracy Enhancement
+
+- Normalize corrupted label text: Some PDFs render label headers with doubled letters (e.g., `PPRROODDUUCCTT NNAAMMEE`). The parser strips such doubled-letter label prefixes before evaluating candidates, ensuring clean product names like `Whiteboard cleaner`.
+- Duplicate-letter tolerant label matching for Section 1 use/description: When labels like `RReeccoommmmeennddeedd UUssee` occur, the extractor compresses duplicate letters on-the-fly and matches the intended label, correctly capturing values such as `Used to clean whiteboards.` without hardcoding product names.
+- Issue date fallback: If standard Issue/Revision/Prepared date patterns aren’t found, the parser scans for trailing labels like `Last Updated`, `Last Revision`, `Updated on`, etc., and accepts month–year forms (e.g., `August 2015`) by normalizing to the first of the month (`2015-08-01`). This is applied only as a fallback to avoid altering correct earlier matches.
+- Avoid mislabeling product codes: `Product code` is no longer used as a product-name label. This prevents numeric codes (e.g., `0000003477`) from being captured as the product name, favoring `GHS product identifier` / `Product Identifier` instead.
+- Manufacturer cleanup: Manufacturer strings are trimmed to the legal entity suffix (e.g., `PTY LTD`, `LTD`, `INC`, etc.) and parentheses that contain registry numbers or historical names (e.g., `ABN`, `ACN`, `Formerly`) are removed.
+- Section header robustness: Section detection tolerates hyphens after section numbers (e.g., `Section 1 - ...`) and falls back to global label extraction when Section 1 headers are OCR-mangled.
 
 1. **Train on More Samples**: Test with diverse SDS document types
 2. **Pattern Refinement**: Improve regex patterns based on extraction failures
@@ -216,6 +252,7 @@ test_files = [
 When code changes in this module, update the related docs/readmes in the same PR to keep behavior aligned.
 
 Relevant documentation locations:
+
 - Parser guide (this file): `chemfetch-backend-live/ocr_service/sds_parser_new/AGENTS.md`
 - OCR service agent guide: `chemfetch-backend-live/ocr_service/AGENTS.md`
 - OCR service overview: `chemfetch-backend-live/ocr_service/README.md`
@@ -223,6 +260,7 @@ Relevant documentation locations:
 - Test data/results: `chemfetch-backend-live/test-data/`
 
 If changes affect API shapes or behavior, also review:
+
 - Backend routes: `chemfetch-backend-live/server/routes/`
 - Root overview: `README.md`
 

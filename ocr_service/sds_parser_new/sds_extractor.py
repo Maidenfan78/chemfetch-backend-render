@@ -49,14 +49,37 @@ except Exception:
     pytesseract = None
     OCR_AVAILABLE = False
 
+# Optional PIL import for PyMuPDF raster OCR fallback (avoids Poppler dependency)
 try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None  # type: ignore
+    PIL_AVAILABLE = False
+
+try:
+    # Prefer modular extractors for better maintainability
+    from .modules.section_1 import (
+        description as fe_extract_description,
+        product_name as fe_extract_product_name,
+        manufacturer as fe_extract_manufacturer,
+    )
     from .modules.field_extractor import (
-        extract_description as extract_section1_description,
+        extract_section14_field as fe_extract_section14_field,
+        extract_date_from_header as fe_extract_date_from_header,
     )
+    from .modules.utils import clean_company_candidate as fe_clean_company
 except ImportError:  # pragma: no cover - fallback when run as script
-    from modules.field_extractor import (
-        extract_description as extract_section1_description,
+    from modules.section_1 import (
+        description as fe_extract_description,
+        product_name as fe_extract_product_name,
+        manufacturer as fe_extract_manufacturer,
     )
+    from modules.field_extractor import (
+        extract_section14_field as fe_extract_section14_field,
+        extract_date_from_header as fe_extract_date_from_header,
+    )
+    from modules.utils import clean_company_candidate as fe_clean_company
 
 # Common field labels used to trim values when multiple labels appear on one line
 COMMON_FIELD_LABELS = [
@@ -258,16 +281,79 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
         except Exception as e:
             logger.warning(f"OCR failed: {e}")
 
+    # Fallback OCR without Poppler using PyMuPDF rasterization
+    # Useful on systems where pdf2image/poppler is unavailable
+    if PYMUPDF_AVAILABLE and OCR_AVAILABLE and pytesseract and PIL_AVAILABLE and fitz and Image:
+        try:
+            doc = fitz.open(str(pdf_path))  # type: ignore
+            ocr_text_parts = []
+            # Render each page to a high-resolution image for better OCR accuracy
+            # Use a zoom matrix (~200 DPI equivalent)
+            zoom = 2.0
+            mat = fitz.Matrix(zoom, zoom)  # type: ignore
+            for page in doc:  # type: ignore
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                # Convert pixmap to PIL Image
+                mode = "RGB" if pix.n >= 3 else "L"
+                img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+                # Optional light preprocessing: ensure grayscale to reduce noise
+                if mode != "L":
+                    img = img.convert("L")
+                ocr_text_parts.append(pytesseract.image_to_string(img))
+            doc.close()
+            ocr_text = "\n".join(ocr_text_parts).strip()
+            if ocr_text:
+                logger.info(f"Extracted {len(ocr_text)} chars using PyMuPDF OCR fallback")
+                return ocr_text
+        except Exception as e:
+            logger.warning(f"PyMuPDF OCR fallback failed: {e}")
+
     logger.error("All text extraction methods failed")
     return ""
 
 
 def get_section(text: str, section_num: int) -> str:
-    """Extract a specific section from SDS text."""
-    # Look for section headers
-    pattern = rf'(?:^|\n)\s*(?:section\s*)?{section_num}(?!\s*/)(?:\s|:|\.).*?(?=\n\s*(?:section\s*)?\d{{1,2}}(?!\.\d)(?!\s*/)(?:\s|:|\.)|$)'
-    match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-    return match.group(0) if match else ""
+    """Extract a specific section from SDS text with robust boundaries.
+
+    Strategy:
+    - Prefer clear section headers that start a line and are either "Section N"
+      or "N." / "N:" followed by a plausible title.
+    - For Section 1 and 14, further require common title keywords to avoid
+      matching numbered list items (e.g., "1. Classified by Chemwatch").
+    - If strict matching fails (rare layouts), fall back to a looser regex similar
+      to previous logic.
+    """
+    # Build start pattern
+    if section_num == 1:
+        # Identification can be OCR-mangled; allow leading bullets/symbols and rely on section number
+        start_pat = rf'^\W*(?:section\s*)?1\s*[:\.-]?\s.*$'
+    elif section_num == 14:
+        # Relaxed: allow leading bullets/symbols
+        start_pat = rf'^\W*(?:section\s*)?14\s*[:\.-]?\s.*$'
+    else:
+        # Require punctuation after number to avoid addresses like "2 Fred ..."
+        start_pat = rf'^\s*(?:section\s*)?{section_num}\s*[:\.-]\s.*$'
+
+    # A header for any subsequent section
+    next_pat = r'^\W*(?:section\s*)?\d{1,2}\s*[:\.-]\s'
+
+    start_m = re.search(start_pat, text, re.IGNORECASE | re.MULTILINE)
+    if start_m:
+        # Begin right after the matched header line to avoid re-matching the same header
+        start = start_m.start()
+        search_from = start_m.end()
+        next_m = re.search(next_pat, text[search_from:], re.IGNORECASE | re.MULTILINE)
+        end = (search_from + next_m.start()) if next_m else len(text)
+        section = text[start:end]
+        # Guard against pathological tiny matches from OCR noise
+        if len(section.strip()) >= 30:
+            return section
+
+    # Fallback (looser) single pass, keeps prior behavior if strict fails
+    loose = rf'(?:^|\n)\s*(?:section\s*)?{section_num}(?!\s*/)(?:\s|:|\.|-).*?' \
+            rf'(?=\n\s*(?:section\s*)?\d{{1,2}}(?!\.\d)(?!\s*/)(?:\s|:|\.|-)|$)'
+    m2 = re.search(loose, text, re.IGNORECASE | re.DOTALL)
+    return m2.group(0) if m2 else ""
 
 
 def extract_field_value(text: str, field_labels: list, section_text: str = None) -> Optional[str]:
@@ -349,23 +435,38 @@ def extract_dg_class_from_table(section_text: str) -> Optional[str]:
         return None
 
     lines = [line.strip() for line in section_text.splitlines() if line.strip()]
-    header_index = None
+
+    # Detect presence of modal headers (ADG IMDG IATA)
+    has_modal_headers = any(re.search(r'\bADG\b.*\bIMDG\b.*\bIATA\b', l, re.IGNORECASE) for l in lines)
+
+    # Prefer explicit 'Transport hazard class(es)' rows and choose ADG if multiple present
+    for i, line in enumerate(lines):
+        if re.search(r'Transport\s+hazard', line, re.IGNORECASE):
+            # Combine with next line to catch split 'class(es)'
+            combined = line
+            if i + 1 < len(lines):
+                combined += ' ' + lines[i + 1]
+            # Remove the label portion
+            combined_tail = re.sub(r'^.*?Transport\s+hazard\s*(?:class(?:\(es\))?)?\s*', '', combined, flags=re.IGNORECASE)
+            # Extract tokens and validate
+            tokens = [t.strip(',;') for t in re.split(r'\s+|\|', combined_tail) if t.strip()]
+            classes = [t for t in tokens if validate_dangerous_goods_class(t)]
+            if classes:
+                # If table with ADG/IMDG/IATA present, the first class corresponds to ADG
+                chosen = classes[0] if has_modal_headers else classes[0]
+                logger.info(f"[SDS_EXTRACTOR] DG class from transport hazard row: '{chosen}'")
+                return chosen
+
+    # Fallback: look for generic 'DG Class' or 'Class:' in a nearby segment
     for idx, line in enumerate(lines):
-        if re.search(r'DG\s+Class|Class\s*:', line, re.IGNORECASE):
-            header_index = idx
-            break
-
-    if header_index is None:
-        return None
-
-    # Look in the header line and next few lines for DG class value
-    for line in lines[header_index: header_index + 6]:
-        tokens = re.split(r'\s+', line.replace('|', ' '))
-        for token in tokens:
-            token = token.strip(',;')
-            if validate_dangerous_goods_class(token):
-                logger.info(f"[SDS_EXTRACTOR] Found DG class in table: '{token}'")
-                return token
+        if re.search(r'DG\s*Class|Class\s*:', line, re.IGNORECASE):
+            for line2 in lines[idx: idx + 6]:
+                tokens = re.split(r'\s+|\|', line2)
+                for token in tokens:
+                    token = token.strip(',;')
+                    if validate_dangerous_goods_class(token):
+                        logger.info(f"[SDS_EXTRACTOR] Found DG class in table: '{token}'")
+                        return token
 
     return None
 
@@ -380,27 +481,24 @@ def extract_packing_group_from_table(section_text: str) -> Optional[str]:
     # Look for packing group in table format
     for i, line in enumerate(lines):
         if re.search(r'packing\s+group', line, re.IGNORECASE):
-            # Check same line for value after the header
-            parts = re.split(r'\s{2,}|\t|\|', line)  # Split on multiple spaces, tabs, or pipes
-            if len(parts) > 1:
-                for part in parts[1:]:  # Skip the header part
-                    part = part.strip(',;')
-                    if part and re.match(r'^(I{1,3}|IV?|N\.?/?A\.?|None|Not\s+(?:applicable|required|assigned)|Not\s+subject)$', part, re.IGNORECASE):
-                        logger.info(f"[SDS_EXTRACTOR] Found packing group in table: '{part}'")
-                        return part
+            # Prefer values on the same line after the label; pick ADG (first) if multiple present
+            tail = re.sub(r'^.*?packing\s+group\s*', '', line, flags=re.IGNORECASE)
+            tokens = [t.strip(',;') for t in re.split(r'\s+|\|', tail) if t.strip()]
+            vals = [t for t in tokens if re.match(r'^(I{1,3}|IV?|N\.?/?A\.?|None|Not\s+(?:applicable|required|assigned)|Not\s+subject)$', t, re.IGNORECASE)]
+            if vals:
+                chosen = vals[0]
+                logger.info(f"[SDS_EXTRACTOR] Packing group from header line: '{chosen}'")
+                return chosen
             
-            # Check next few lines for table data
+            # Otherwise, look into next few lines and return the first valid (ADG column)
             for j in range(i + 1, min(i + 4, len(lines))):
                 table_line = lines[j].strip()
                 if not table_line:
                     continue
-                
-                # Split table row into cells
-                cells = re.split(r'\s{2,}|\t|\|', table_line)
+                cells = [c.strip(',;') for c in re.split(r'\s{2,}|\t|\|', table_line) if c.strip()]
                 for cell in cells:
-                    cell = cell.strip(',;')
-                    if cell and re.match(r'^(I{1,3}|IV?|N\.?/?A\.?|None|Not\s+(?:applicable|required|assigned)|Not\s+subject)$', cell, re.IGNORECASE):
-                        logger.info(f"[SDS_EXTRACTOR] Found packing group in table row: '{cell}'")
+                    if re.match(r'^(I{1,3}|IV?|N\.?/?A\.?|None|Not\s+(?:applicable|required|assigned)|Not\s+subject)$', cell, re.IGNORECASE):
+                        logger.info(f"[SDS_EXTRACTOR] Packing group from table row: '{cell}'")
                         return cell
     
     return None
@@ -409,6 +507,14 @@ def extract_packing_group_from_table(section_text: str) -> Optional[str]:
 def extract_product_name(section1_text: str) -> Optional[str]:
     """Extract product name with multiple strategies - FIXED to avoid labels."""
     
+    # Strategy 0: Use modular extractor first
+    try:
+        mod_val = fe_extract_product_name(section1_text)
+        if mod_val:
+            return mod_val
+    except Exception:
+        pass
+
     # Strategy 1: Look for explicit labels
     labels = [
         r'Product\s+identifier',
@@ -467,6 +573,9 @@ def extract_product_name(section1_text: str) -> Optional[str]:
                         lowered = line.lower()
                         if any(tok in lowered for tok in ['proper shipping name', 'shipping name', 'un number', 'transport', 'hazchem', 'epg', 'chemical formula', 'not applicable']):
                             continue
+                        # Skip date headers that sometimes appear as standalone lines
+                        if re.match(r'^(msds\s+date|date\s+of\s+issue|revision\s+date|version\s+date)\b', lowered, re.IGNORECASE):
+                            continue
                         candidate = strip_leading_label_prefix(line)
                         candidate = dedup_repeated_phrase(candidate)
                         logger.info(f"Found potential product name: '{candidate}'")
@@ -478,6 +587,14 @@ def extract_product_name(section1_text: str) -> Optional[str]:
 def extract_manufacturer(section1_text: str) -> Optional[str]:
     """Extract manufacturer with multiple strategies - FIXED to avoid labels."""
     
+    # Strategy 0: Use modular extractor first
+    try:
+        mod_val = fe_extract_manufacturer(section1_text)
+        if mod_val:
+            return mod_val
+    except Exception:
+        pass
+
     # Strategy 1: Look for explicit labels
     labels = [
         r'Manufacturer',
@@ -525,51 +642,143 @@ def extract_manufacturer(section1_text: str) -> Optional[str]:
 
 def extract_description(section1_text: str) -> Optional[str]:
     """Extract product description/use information from Section 1."""
-    return extract_section1_description(section1_text)
+    try:
+        return fe_extract_description(section1_text)
+    except Exception:
+        # Fall back to legacy inline label extraction
+        return extract_field_value(
+            section1_text,
+            [
+                r'Product\s+description',
+                r'Description',
+                r'Use\s+of\s+the\s+substance',
+                r'Recommended\s+use',
+                r'Intended\s+use',
+                r'Product\s+use',
+                r'Relevant\s+identified\s+uses',
+                r'Identified\s+uses',
+                r'Application',
+            ],
+            section1_text,
+        )
+
+def extract_manufacturer_global(full_text: str) -> Optional[str]:
+    """Fallback manufacturer search across the first page/lines of the document.
+    Avoids section scoping issues when details are outside Section 1.
+    """
+    if not full_text:
+        return None
+    head = "\n".join(full_text.splitlines()[:60])
+    labels = [
+        r'Manufacturer',
+        r'Supplier\s+Name',
+        r'Supplier',
+        r'Company\s+name\s+of\s+supplier',
+        r'Producer',
+        r'Company\s+name',
+        r'Registered\s+company\s+name',
+        r'Distributor',
+        r'Manufacturer\s*/\s*Supplier',
+        r'Details\s+of\s+the\s+supplier',
+    ]
+    val = extract_field_value(head, labels, head)
+    if val and not is_noise_text(val):
+        return strip_leading_label_prefix(dedup_repeated_phrase(val))
+    return None
 
 
 def extract_date(text: str) -> Optional[str]:
-    """Extract issue/revision date with enhanced patterns."""
-    
-    # Look for date patterns with labels - IMPROVED PATTERNS
+    """Extract issue/revision date with enhanced patterns and prioritization.
+
+    Priority: Issue/Revision/Prepared (and similar) over Print/Printed.
+    """
+
+    # 0) Fast path: explicitly look for labeled ISO-like dates first (robust for OCR)
+    iso_label = re.search(
+        r'(Issue\s*Date|Revision(?:\s*Date)?|Date\s*of\s*issue|Version\s*date|Date\s*Prepared|Prepared\s*on|Issued)[^\n]{0,60}?(\d{4}-\d{2}-\d{2})',
+        text,
+        re.IGNORECASE,
+    )
+    if iso_label:
+        return iso_label.group(2)
+
+    # 1) Prefer modular labeled extraction (captures and prioritizes by label)
+    try:
+        try:
+            from .modules.date_parser import extract_issue_date as mod_extract_issue_date
+        except ImportError:  # pragma: no cover
+            from modules.date_parser import extract_issue_date as mod_extract_issue_date
+        labeled = mod_extract_issue_date(text)
+        if labeled:
+            return labeled
+    except Exception:
+        pass
+
+    # 2) Fallback to explicit labeled regexes (legacy)
     date_patterns = [
-        # Standard patterns
-        r'(?:Issue\s+Date|Revision\s+Date|Date\s+of\s+issue|Version\s+date|Date\s+Prepared|Issued|MSDS\s+Date)[^\n]{0,30}?[:\-]?\s*(\d{1,2}[\-\/\.]+\d{1,2}[\-\/\.]+\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Za-z]+\s+\d{1,2},?\s*\d{4}|\d{1,2}\s+[A-Za-z]+\s+\d{4})',
-        # Header patterns for sds_3.pdf type issues  
+        # Labeled + various formats, including dd-MMM-YYYY
+        r'(?:Issue\s*Date|Revision(?:\s*Date)?|Date\s*of\s*issue|Version\s*date|Date\s*Prepared|Prepared\s*on|Issued|MSDS\s*Date|SDS\s*Date|Last\s*Updated|Last\s*Revision|Last\s*Revised|Updated\s*on|Last\s*Modified|Effective\s*Date)[^\n]{0,40}?[:\-]?\s*' \
+        r'(\d{1,2}[\-\/\.]+\d{1,2}[\-\/\.]+\d{2,4}|\d{4}-\d{2}-\d{2}|[A-Za-z]+\.?\s+\d{1,2},?\s*\d{4}|\d{1,2}\s+[A-Za-z]+\.?\s+\d{4}|\d{1,2}[\-\/.][A-Za-z]{3,}\.?[\-\/.]\d{2,4}|[A-Za-z]+\.?\s+\d{4})',
         r'Revision[:\s]*(\d{4}-\d{2}-\d{2})',
         r'Revision[:\s]*(\d{1,2}[\-\/]\d{1,2}[\-\/]\d{4})',
-        # REVISION DATE patterns for sds_5.pdf
-        r'REVISION\s+DATE[:\s]*(\d{1,2}\s+\w+\s+\d{4})',
+        r'Revision[:\s]*(\d{1,2}[\-\/.][A-Za-z]{3,}\.?[\-\/.]\d{2,4})',
+        r'REVISION\s+DATE[:\s]*(\d{1,2}\s+\w+\.?\s+\d{4})',
         r'REVISION\s+DATE[:\s]*(\d{1,2}[\-\/]\d{1,2}[\-\/]\d{4})',
+        r'REVISION\s+DATE[:\s]*(\d{1,2}[\-\/.][A-Za-z]{3,}\.?[\-\/.]\d{2,4})',
     ]
-    
     for pattern in date_patterns:
         matches = re.findall(pattern, text, re.IGNORECASE)
         if matches:
-            # Try to parse and validate date
             try:
                 from datetime import datetime, date
-                
-                for date_str in matches:
-                    try:
-                        # Try different formats
-                        formats = ['%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d.%m.%Y', 
-                                 '%d %b %Y', '%d %B %Y', '%b %d %Y', '%B %d %Y']
-                        for fmt in formats:
+                # Prefer candidates containing a 4-digit year when available
+                def has_four_digit_year(s: str) -> bool:
+                    return bool(re.search(r"\b\d{4}\b", s))
+                # Normalize to list (re.findall may return tuples when groups present)
+                norm = []
+                for m in matches:
+                    if isinstance(m, tuple):
+                        # pick the last non-empty group (typical date capture)
+                        for part in m[::-1]:
+                            if part:
+                                norm.append(part)
+                                break
+                    else:
+                        norm.append(m)
+                # Stable sort: 4-digit year first
+                ordered = sorted(norm, key=lambda s: (0 if has_four_digit_year(str(s)) else 1))
+                for date_str in ordered:
+                    # Normalize month abbreviations with trailing dot
+                    cleaned = re.sub(r'\b([A-Za-z]{3,})\.', r'\1', date_str)
+                    for fmt in ['%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d.%m.%Y', '%d %b %Y', '%d %B %Y', '%b %d %Y', '%B %d %Y', '%d-%b-%Y', '%d-%b-%y', '%d.%b.%Y', '%d.%b.%y']:
+                        try:
+                            parsed_date = datetime.strptime(cleaned, fmt).date()
+                            if parsed_date <= date.today():
+                                return parsed_date.strftime('%Y-%m-%d')
+                        except ValueError:
+                            continue
+                    # Fallback: Month Year (no day) -> set day=01
+                    m = re.fullmatch(r'([A-Za-z]+)\s+(\d{4})', cleaned)
+                    if m:
+                        for fmt in ['%b %Y', '%B %Y']:
                             try:
-                                parsed_date = datetime.strptime(date_str, fmt).date()
-                                if parsed_date <= date.today():  # Must be in the past
-                                    formatted_date = parsed_date.strftime('%Y-%m-%d')
-                                    logger.info(f"[SDS_EXTRACTOR] Parsed date '{date_str}' as '{formatted_date}'")
-                                    return formatted_date
+                                dt = datetime.strptime(cleaned, fmt)
+                                parsed_date = date(dt.year, dt.month, 1)
+                                if parsed_date <= date.today():
+                                    return parsed_date.strftime('%Y-%m-%d')
                             except ValueError:
                                 continue
-                    except Exception:
-                        continue
             except ImportError:
-                # If datetime not available, return first match
-                return matches[0]
-    
+                return norm[0] if norm else None
+
+    # 3) Finally, header-based extraction (includes print/printing date variants)
+    try:
+        hdr = fe_extract_date_from_header(text)
+        if hdr:
+            return hdr
+    except Exception:
+        pass
+
     return None
 
 
@@ -615,13 +824,41 @@ def parse_pdf(path: Path) -> Dict[str, Any]:
     
     # Product name
     product_name = extract_product_name(section1)
+    prefix = '\n'.join(text.splitlines()[:15])
     if not product_name:
-        prefix = '\n'.join(text.splitlines()[:15])
+        # Try prefix
         product_name = extract_product_name(prefix)
+    # If still missing or looks like an SDS header/date, try global label-based extractor
+    sds_header_like = False
+    if product_name:
+        lowered = str(product_name).lower().strip()
+        # Treat lines mentioning SDS or Safety Data Sheet as header-like, regardless of date format
+        if re.search(r'\b(?:sds|safety\s+data\s+sheet)\b', lowered):
+            sds_header_like = True
+    if not product_name or sds_header_like:
+        try:
+            alt_global = fe_extract_product_name(text)
+        except Exception:
+            alt_global = None
+        if alt_global:
+            product_name = alt_global
     result['product_name'] = {'value': product_name, 'confidence': 1.0 if product_name else 0.0}
     
     # Manufacturer
     manufacturer = extract_manufacturer(section1)
+    if not manufacturer:
+        # Fallback to global scan in case supplier/manufacturer details sit outside Section 1
+        manufacturer = extract_manufacturer_global(text)
+    # Final cleanup to remove any leaked labels or concatenated fields
+    if manufacturer:
+        # Trim anything after Product Name/Trade name label fragments
+        manufacturer = re.split(r'\b(Product\s+Name|Trade\s+name)\b', manufacturer, flags=re.IGNORECASE)[0].strip()
+        manufacturer = strip_leading_label_prefix(dedup_repeated_phrase(manufacturer))
+        # Final pass through company cleaner to trim ABN/FORMERLY parentheses and clip at suffixes
+        try:
+            manufacturer = fe_clean_company(manufacturer)
+        except Exception:
+            pass
     result['manufacturer'] = {'value': manufacturer, 'confidence': 1.0 if manufacturer else 0.0}
     
     # Product description (NEW FIELD - from Section 1 only)
@@ -639,19 +876,24 @@ def parse_pdf(path: Path) -> Dict[str, Any]:
     result['product_use'] = {'value': product_use, 'confidence': 1.0 if product_use else 0.0}
     
     # Dangerous goods class (from Section 14) - RESTORE WORKING LOGIC
-    dg_class = extract_field_value(
-        text,
-        [
-            r'DG\s*Class',
-            r'Class',
-            r'Transport\s*hazard\s*class(?:\(es\))?',
-            r'(?:IMDG|IATA|ADG)?\s*Hazard\s*Class(?:\(es\))?',
-            r'Hazard\s*class(?:\(es\))?',
-            r'Dangerous\s*goods\s*class',
-        ],
-        section14,
-    )
-
+    # Prefer modular Section 14 extractor; fallback to legacy patterns
+    dg_labels = [
+        r'DG\s*Class',
+        r'Class',
+        r'Class/Division',
+        r'Transport\s*hazard\s*class(?:\(es\))?',
+        r'(?:IMDG|IATA|ADG)?\s*Hazard\s*Class(?:\(es\))?',
+        r'Hazard\s*class(?:\(es\))?',
+        r'Dangerous\s*goods\s*class',
+        r'UN\s*Class',
+    ]
+    dg_class = None
+    try:
+        dg_class = fe_extract_section14_field(section14, dg_labels, 'dangerous_goods_class')
+    except Exception:
+        dg_class = None
+    if not dg_class:
+        dg_class = extract_field_value(text, dg_labels, section14)
     if not dg_class:
         dg_class = extract_dg_class_from_table(section14)
 
@@ -667,14 +909,26 @@ def parse_pdf(path: Path) -> Dict[str, Any]:
     result['subsidiary_risk'] = {'value': subsidiary_risk, 'confidence': 1.0 if subsidiary_risk else 0.0}
     
     # Packing group - RESTORE WORKING LOGIC + ADD TABLE SUPPORT
-    packing_group = extract_field_value(text, [
+    # Packing group via modular extractor, with fallbacks
+    pg_labels = [
         r'Packing\s*group(?:\(s\))?',
         r'Packing\s*group\s*\(if\s*applicable\)',
-        r'PG'
-    ], section14)
-    
+        r'PG',
+    ]
+    packing_group = None
+    try:
+        packing_group = fe_extract_section14_field(section14, pg_labels, 'packing_group')
+    except Exception:
+        packing_group = None
+    if not packing_group:
+        packing_group = extract_field_value(text, pg_labels, section14)
     if not packing_group:
         packing_group = extract_packing_group_from_table(section14)
+    # Normalize duplicated values like "II II" -> "II"
+    if packing_group:
+        toks = [t for t in re.split(r'\s+', packing_group) if t]
+        if toks and all(t.upper() == toks[0].upper() for t in toks):
+            packing_group = toks[0]
     
     result['packing_group'] = {'value': packing_group, 'confidence': 1.0 if packing_group else 0.0}
     
