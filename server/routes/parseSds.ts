@@ -224,7 +224,7 @@ router.post('/', async (req, res) => {
           hazardous_substance: parsedMetadata.hazardous_substance,
           dangerous_good: parsedMetadata.dangerous_good,
           dangerous_goods_class: parsedMetadata.dangerous_goods_class,
-          description: parsedMetadata.product_name,
+          description: parsedMetadata.description,
           packing_group: parsedMetadata.packing_group,
           subsidiary_risks: parsedMetadata.subsidiary_risks,
           raw_json: parsedMetadata,
@@ -251,8 +251,11 @@ router.post('/', async (req, res) => {
             dangerous_goods_class: parsedMetadata.dangerous_goods_class,
             packing_group: parsedMetadata.packing_group,
             subsidiary_risks: parsedMetadata.subsidiary_risks,
+            // Only backfill item description if currently null
+            description: parsedMetadata.description || null,
           })
-          .eq('product_id', product_id);
+          .eq('product_id', product_id)
+          .is('description', null);
 
         if (updateError) {
           logger.warn({ error: updateError }, 'Failed to update user watch lists');

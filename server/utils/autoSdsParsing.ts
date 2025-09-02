@@ -226,7 +226,7 @@ async function executeSdsParsing(productId: number, sdsUrl: string): Promise<voi
       hazardous_substance: parsedMetadata.hazardous_substance,
       dangerous_good: parsedMetadata.dangerous_good,
       dangerous_goods_class: parsedMetadata.dangerous_goods_class,
-      description: parsedMetadata.product_name,
+      description: parsedMetadata.description,
       packing_group: parsedMetadata.packing_group,
       subsidiary_risks: parsedMetadata.subsidiary_risks,
       raw_json: parsedMetadata.raw_json || parsedMetadata,
@@ -251,8 +251,11 @@ async function executeSdsParsing(productId: number, sdsUrl: string): Promise<voi
         dangerous_goods_class: parsedMetadata.dangerous_goods_class,
         packing_group: parsedMetadata.packing_group,
         subsidiary_risks: parsedMetadata.subsidiary_risks,
+        // Backfill missing item descriptions only
+        description: parsedMetadata.description || null,
       })
-      .eq('product_id', productId);
+      .eq('product_id', productId)
+      .is('description', null);
 
     logger.info(`Auto-SDS: Successfully parsed and stored metadata for product ${productId}`);
   } catch (error: any) {

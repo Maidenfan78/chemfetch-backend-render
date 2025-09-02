@@ -117,6 +117,7 @@ def transform_to_chemfetch_format(parsed_data: Dict[str, Any], product_id: int) 
         'product_name': get_value('product_name'),
         'vendor': manufacturer,
         'issue_date': get_value('issue_date'),
+        'description': get_value('description'),
         'hazardous_substance': is_hazardous,
         'dangerous_good': is_dangerous_good,
         'dangerous_goods_class': dangerous_goods_class,

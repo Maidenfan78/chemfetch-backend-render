@@ -442,6 +442,7 @@ def parse_sds_http():
                 "product_id": _get("product_id", int(product_id)),
                 "vendor": _get("vendor"),
                 "issue_date": _get("issue_date"),
+                "description": _get("description"),
                 "hazardous_substance": _get("hazardous_substance"),
                 "dangerous_good": _get("dangerous_good"),
                 "dangerous_goods_class": _get("dangerous_goods_class"),
