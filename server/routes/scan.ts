@@ -248,7 +248,19 @@ router.post('/', async (req, res) => {
         '[SCAN] Raw URLs from search',
       );
 
-      const cleaned = [...new Set((urls || []).map(normaliseUrl).filter(Boolean))] as string[];
+      let cleaned = [...new Set((urls || []).map(normaliseUrl).filter(Boolean))] as string[];
+
+      // AU-first: prefer Australian domains/content, then non-PDF product pages
+      const score = (u: string) => {
+        const s = u.toLowerCase();
+        let sc = 0;
+        if (s.includes('.com.au') || s.includes('australia') || /(^|[\/?._-])(au|en-au|en_au)(?=($|[\/?._-]))/.test(s)) sc += 30;
+        if (s.endsWith('.ca') || s.includes('/ca/') || s.includes('en-ca') || s.includes('canada')) sc -= 20;
+        if (s.endsWith('.pdf')) sc -= 10; // prefer product pages first
+        return sc;
+      };
+      cleaned = cleaned.sort((a, b) => score(b) - score(a));
+
       logger.info({ code, cleaned }, '[SCAN] Normalised URLs for scraping');
 
       const scrapingStart = Date.now();

@@ -12,6 +12,21 @@ if (!fs.existsSync(logsDir)) {
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
   timestamp: () => `,"time":"${new Date().toISOString()}"`,
+  // Best-effort redaction of common sensitive fields in structured logs
+  redact: {
+    paths: [
+      'req.headers.authorization',
+      'req.headers.cookie',
+      'res.headers.set-cookie',
+      'req.body.password',
+      'req.body.token',
+      'req.query.key',
+      'req.body.key',
+      'query.key',
+      'body.key',
+    ],
+    censor: '[REDACTED]',
+  },
 });
 
 // Custom write function to also write to file

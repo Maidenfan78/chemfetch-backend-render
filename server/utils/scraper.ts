@@ -38,15 +38,9 @@ function getGoogleSearchConfig() {
     GOOGLE_SEARCH_API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
     GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID || '45c531108e8b44924';
 
+    // Log only non-sensitive configuration traits
     console.log('[GOOGLE_SEARCH_CONFIG] API Key present:', !!GOOGLE_SEARCH_API_KEY);
     console.log('[GOOGLE_SEARCH_CONFIG] Search Engine ID:', GOOGLE_SEARCH_ENGINE_ID);
-    if (GOOGLE_SEARCH_API_KEY) {
-      console.log('[GOOGLE_SEARCH_CONFIG] API Key length:', GOOGLE_SEARCH_API_KEY.length);
-      console.log(
-        '[GOOGLE_SEARCH_CONFIG] API Key starts with:',
-        GOOGLE_SEARCH_API_KEY.substring(0, 10) + '...',
-      );
-    }
   }
 
   return { GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID };
@@ -69,6 +63,79 @@ const http = axios.create({
   },
   validateStatus: () => true,
 });
+
+// -----------------------------------------------------------------------------
+// Country preference helpers (AU-first by default)
+// -----------------------------------------------------------------------------
+type CountryCode = 'AU' | 'NZ' | 'US' | 'UK' | 'GB' | 'EU' | 'CA' | 'OTHER';
+
+function getPreferredCountries(): CountryCode[] {
+  const raw = process.env.SDS_COUNTRY_PREFERENCE;
+  if (raw && typeof raw === 'string') {
+    return raw
+      .split(',')
+      .map(s => s.trim().toUpperCase())
+      .filter(Boolean)
+      .map(s => (s === 'GB' ? 'UK' : (s as CountryCode)) as CountryCode);
+  }
+  // Default AU-first, then reasonable fallbacks
+  return ['AU', 'NZ', 'UK', 'US', 'EU', 'CA'];
+}
+
+function detectCountryFromUrl(url: string): CountryCode {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    const path = (u.pathname + (u.search || '')).toLowerCase();
+
+    // Host-based
+    if (host.endsWith('.com.au') || host.endsWith('.org.au') || host.endsWith('.gov.au') || host.endsWith('.au')) return 'AU';
+    if (host.endsWith('.co.nz') || host.endsWith('.nz')) return 'NZ';
+    if (host.endsWith('.co.uk') || host.endsWith('.uk')) return 'UK';
+    if (host.endsWith('.eu')) return 'EU';
+    if (host.endsWith('.ca')) return 'CA';
+    if (host.endsWith('.com') && (host.includes('wurth.com.au') || host.includes('chemwatch.net/au'))) return 'AU';
+
+    // Path/locale hints
+    const has = (re: RegExp) => re.test(path);
+    if (
+      has(/(^|[\/?._-])(au|en-au|en_au)(?=($|[\/?._-]))/) ||
+      path.includes('australia')
+    )
+      return 'AU';
+    if (has(/(^|[\/?._-])(nz|en-nz|en_nz)(?=($|[\/?._-]))/)) return 'NZ';
+    if (has(/(^|[\/?._-])(uk|gb|en-gb|en_uk|en_gb)(?=($|[\/?._-]))/)) return 'UK';
+    if (has(/(^|[\/?._-])(us|en-us|en_us)(?=($|[\/?._-]))/)) return 'US';
+    if (has(/(^|[\/?._-])(eu)(?=($|[\/?._-]))/)) return 'EU';
+    if (has(/(^|[\/?._-])(ca|en-ca|en_ca|canada)(?=($|[\/?._-]))/) || path.includes('canada')) return 'CA';
+
+    return 'OTHER';
+  } catch {
+    return 'OTHER';
+  }
+}
+
+function scoreUrlByCountryPreference(url: string): number {
+  const country = detectCountryFromUrl(url);
+  const prefs = getPreferredCountries();
+  // Higher score for earlier in preference list
+  const idx = prefs.indexOf(country);
+  const base = idx >= 0 ? (prefs.length - idx) * 10 : 0;
+
+  // Boost explicit Australian indicators even on generic hosts
+  let bonus = 0;
+  const lower = url.toLowerCase();
+  if (lower.includes('australia')) bonus += 6;
+  if (/(^|[\/?._-])(au|en-au|en_au)(?=($|[\/?._-]))/.test(lower)) bonus += 6;
+  if (lower.includes('.com.au')) bonus += 8;
+
+  // Penalise Canadian variants if not first preference
+  const caPenalty = prefs[0] !== 'CA' && (lower.endsWith('.ca') || /(^|[\/?._-])(ca|en-ca|en_ca|canada)(?=($|[\/?._-]))/.test(lower) || lower.includes('canada'))
+    ? 8
+    : 0;
+
+  return base + bonus - caPenalty;
+}
 
 // Helper to verify SDS PDF by calling the OCR microservice verify-sds endpoint
 async function verifySdsUrl(
@@ -170,7 +237,10 @@ async function fetchGoogleSearchResults(query: string): Promise<{ title: string;
       searchUrl.searchParams.set('lr', 'lang_en'); // Language restrict: English
       searchUrl.searchParams.set('safe', 'off'); // Don't filter results
 
-      console.log(`[GOOGLE_SEARCH] API URL: ${searchUrl.toString()}`);
+      // Never log secrets: redact the 'key' param before logging
+      const safeUrl = new URL(searchUrl.toString());
+      safeUrl.searchParams.set('key', 'REDACTED');
+      console.log(`[GOOGLE_SEARCH] API URL: ${safeUrl.toString()}`);
 
       const response = await axios.get(searchUrl.toString(), { timeout: 10000 });
 
@@ -213,10 +283,13 @@ async function fetchGoogleSearchResults(query: string): Promise<{ title: string;
       allResults = [...allResults, ...pdfResults];
     }
 
-    // Remove duplicates while preserving order
+    // Remove duplicates while preserving order, then sort by country preference
     const uniqueResults = allResults.filter(
       (item, index, self) => index === self.findIndex(other => other.url === item.url),
     );
+
+    // AU-first scoring
+    uniqueResults.sort((a, b) => scoreUrlByCountryPreference(b.url) - scoreUrlByCountryPreference(a.url));
 
     console.log(`[GOOGLE_SEARCH] Total unique results: ${uniqueResults.length}`);
     console.log(`[GOOGLE_SEARCH] Final results:`, uniqueResults.slice(0, 5)); // Log first 5 results
@@ -432,8 +505,11 @@ async function discoverPdfOnHtmlPage(pageUrl: string): Promise<string | null> {
       candidates,
     );
 
-    // Light ranking: prefer explicit SDS keywords then .pdf suffix
+    // Ranking: AU-first by country, then SDS-likeness and PDF suffix
     candidates.sort((a, b) => {
+      const ca = scoreUrlByCountryPreference(a);
+      const cb = scoreUrlByCountryPreference(b);
+      if (cb !== ca) return cb - ca;
       const sa = (looksLikeSdsUrl(a) ? 1 : 0) + (a.toLowerCase().endsWith('.pdf') ? 1 : 0);
       const sb = (looksLikeSdsUrl(b) ? 1 : 0) + (b.toLowerCase().endsWith('.pdf') ? 1 : 0);
       return sb - sa;
@@ -565,24 +641,18 @@ export async function fetchSdsByName(
   // Use relevant hits if we have them, otherwise fall back to all hits
   const searchHits = relevantHits.length > 0 ? relevantHits : hits;
 
-  // Prioritize Australian pharmacy/chemical sites over international ones
+  // Prioritize AU-first by country preference, then pharmacy/chemist heuristics
   const prioritizedHits = searchHits.sort((a, b) => {
+    const cs = scoreUrlByCountryPreference(a.url) - scoreUrlByCountryPreference(b.url);
+    if (cs !== 0) return cs > 0 ? -1 : 1;
+
     const aUrl = a.url.toLowerCase();
     const bUrl = b.url.toLowerCase();
 
-    // Australian pharmacy sites get highest priority
-    const auPharmacyA =
-      aUrl.includes('.com.au') && (aUrl.includes('pharmacy') || aUrl.includes('chemist'));
-    const auPharmacyB =
-      bUrl.includes('.com.au') && (bUrl.includes('pharmacy') || bUrl.includes('chemist'));
+    const auPharmacyA = aUrl.includes('.com.au') && (aUrl.includes('pharmacy') || aUrl.includes('chemist'));
+    const auPharmacyB = bUrl.includes('.com.au') && (bUrl.includes('pharmacy') || bUrl.includes('chemist'));
     if (auPharmacyA && !auPharmacyB) return -1;
     if (auPharmacyB && !auPharmacyA) return 1;
-
-    // Then other Australian sites
-    const auA = aUrl.includes('.com.au');
-    const auB = bUrl.includes('.com.au');
-    if (auA && !auB) return -1;
-    if (auB && !auA) return 1;
 
     // Deprioritize eBay (often has anti-bot protection)
     const ebayA = aUrl.includes('ebay');
@@ -608,6 +678,7 @@ export async function fetchSdsByName(
         const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
         if (ok) {
           console.log('[SCRAPER] Valid SDS PDF found', finalUrl);
+          try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
           SDS_CACHE.set(cacheKey, finalUrl);
           return { sdsUrl: finalUrl, topLinks };
         }
@@ -622,6 +693,7 @@ export async function fetchSdsByName(
         const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
         if (ok) {
           console.log('[SCRAPER] Valid SDS PDF found', finalUrl);
+          try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
           SDS_CACHE.set(cacheKey, finalUrl);
           return { sdsUrl: finalUrl, topLinks };
         }
@@ -636,6 +708,7 @@ export async function fetchSdsByName(
         const ok = await verifySdsUrl(pdf, name, isManualEntry);
         if (ok) {
           console.log('[SCRAPER] Valid SDS PDF via page hop', pdf);
+          try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(pdf)); } catch {}
           SDS_CACHE.set(cacheKey, pdf);
           return { sdsUrl: pdf, topLinks };
         }
