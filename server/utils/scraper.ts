@@ -120,9 +120,9 @@ async function verifySdsUrl(
     console.log(`[SCRAPER] OCR verification result: ${isVerified}`);
     return isVerified;
   } catch (err) {
-    console.log('[SCRAPER] OCR verification failed, accepting SDS-like URLs as fallback');
-    // If OCR service fails, accept URLs that look like SDS documents
-    return looksLikeSdsUrl(url) || url.toLowerCase().endsWith('.pdf');
+    console.log('[SCRAPER] OCR verification failed; using strict URL heuristics');
+    // If OCR service fails, only accept if the URL strongly indicates an SDS
+    return looksLikeSdsUrl(url);
   }
 }
 
@@ -336,7 +336,31 @@ function extractGoogleTarget(url: string): string {
 
 function looksLikeSdsUrl(url: string): boolean {
   const u = url.toLowerCase();
-  return /(sds|msds|safety[-_\s]?data)/i.test(u);
+
+  // Exclude obvious policy/legal docs commonly found on vendor sites
+  const blacklist = [
+    'privacy',
+    'terms',
+    'warranty',
+    'returns',
+    'policy',
+    'statement',
+    'collection',
+    'modern_slavery',
+    'supplier-code-of-conduct',
+    'credit_information',
+    'cookies',
+  ];
+  if (blacklist.some(word => u.includes(word))) return false;
+
+  // Strong indicators for SDS
+  const sdsLike =
+    /(\b|[-_])(sds|msds)(\b|[-_])/.test(u) || /safety[^/\n]*data[^/\n]*sheet/.test(u);
+
+  // Prefer PDFs for SDS content
+  const isPdf = u.endsWith('.pdf');
+
+  return sdsLike && isPdf;
 }
 
 async function isPdfByHeaders(url: string): Promise<{ isPdf: boolean; finalUrl: string }> {
@@ -365,7 +389,7 @@ async function discoverPdfOnHtmlPage(pageUrl: string): Promise<string | null> {
     const finalUrl = (res.request?.res?.responseUrl as string) || pageUrl;
     const $ = cheerio.load(res.data);
 
-    // Look for ANY PDF links, not just ones with SDS keywords
+    // Look for likely SDS PDF links (avoid generic policy/terms documents)
     const candidates: string[] = [];
     $('a[href]').each((_, a) => {
       const href = String($(a).attr('href') || '').trim();
@@ -373,14 +397,40 @@ async function discoverPdfOnHtmlPage(pageUrl: string): Promise<string | null> {
       try {
         const abs = new URL(href, finalUrl).toString();
         const lower = abs.toLowerCase();
-        // Accept any PDF or any link with SDS-related terms
-        if (lower.endsWith('.pdf') || /pdf|sds|msds|safety|data|sheet|document/i.test(lower)) {
+        // Also examine link text for SDS hints
+        const linkText = ($(a).text() || '').toLowerCase();
+
+        const blacklist = [
+          'privacy',
+          'terms',
+          'warranty',
+          'returns',
+          'policy',
+          'statement',
+          'collection',
+          'cookie',
+        ];
+        const hasBlacklist =
+          blacklist.some(w => lower.includes(w)) || blacklist.some(w => linkText.includes(w));
+
+        // Keep only likely SDS PDF links
+        const likelySds =
+          (/(\b|[-_])(sds|msds)(\b|[-_])/.test(lower) ||
+            /safety[^/\n]*data[^/\n]*sheet/.test(lower) ||
+            /(\b|[-_])(sds|msds)(\b|[-_])/.test(linkText) ||
+            /safety[^/\n]*data[^/\n]*sheet/.test(linkText)) &&
+          lower.endsWith('.pdf');
+
+        if (!hasBlacklist && likelySds) {
           candidates.push(abs);
         }
       } catch {}
     });
 
-    console.log(`[SCRAPER] Found ${candidates.length} PDF candidates on ${pageUrl}:`, candidates);
+    console.log(
+      `[SCRAPER] Found ${candidates.length} likely SDS PDF candidates on ${pageUrl}:`,
+      candidates,
+    );
 
     // Light ranking: prefer explicit SDS keywords then .pdf suffix
     candidates.sort((a, b) => {
