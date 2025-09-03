@@ -75,23 +75,6 @@ function normaliseUrl(u: string): string | null {
 }
 
 // --- Routes ------------------------------------------------------------------
-router.post('/sds-by-name', async (req, res) => {
-  const { name, size } = req.body || {};
-  if (!isValidName(name)) return res.status(403).json({ error: 'Invalid name' });
-
-  try {
-    logger.info({ name, size }, '[SDS] Fetching by name');
-    const { sdsUrl, topLinks } = await fetchSdsByName(name, size);
-    logger.info({ name, size, sdsUrl, topLinks }, '[SDS] Fetched SDS URL and top links');
-    return res.json({ sdsUrl, topLinks });
-  } catch (err: any) {
-    logger.error({ err: String(err), name }, '[SDS] Failed');
-    return res
-      .status(502)
-      .json({ error: 'SDS_LOOKUP_FAILED', message: String(err?.message || err) });
-  }
-});
-
 router.post('/', async (req, res) => {
   const requestStartTime = Date.now();
   const { code, userId, name, size } = req.body || {};
