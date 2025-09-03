@@ -8,49 +8,47 @@ if (!fs.existsSync(logsDir)) {
   fs.mkdirSync(logsDir, { recursive: true });
 }
 
-// Simple file-based logger that also logs to console
-const logger = pino({
+const date = new Date().toISOString().split('T')[0];
+const logFile = path.join(logsDir, `backend-${date}.log`);
+
+// Create a file stream for Pino (append mode)
+const fileStream = fs.createWriteStream(logFile, { flags: 'a', encoding: 'utf8' });
+
+// Base logger options
+const baseOptions: pino.LoggerOptions = {
   level: process.env.LOG_LEVEL || 'info',
   timestamp: () => `,"time":"${new Date().toISOString()}"`,
   // Best-effort redaction of common sensitive fields in structured logs
   redact: {
     paths: [
+      // Request headers
       'req.headers.authorization',
       'req.headers.cookie',
-      'res.headers.set-cookie',
+      'req.headers["set-cookie"]', // bracket notation for hyphenated key
+      // Response headers (frameworks often attach this shape)
+      'res.headers["set-cookie"]',
+      // Some libs use `response` instead of `res`
+      'response.headers["set-cookie"]',
+
+      // Bodies / params
       'req.body.password',
       'req.body.token',
-      'req.query.key',
       'req.body.key',
+      'req.query.key',
       'query.key',
       'body.key',
     ],
     censor: '[REDACTED]',
   },
-});
-
-// Custom write function to also write to file
-const originalWrite = process.stdout.write;
-const getLogFileName = () => {
-  const date = new Date().toISOString().split('T')[0];
-  return path.join(logsDir, `backend-${date}.log`);
 };
 
-process.stdout.write = function (chunk: any, encoding?: any, callback?: any) {
-  // Write to console (original behavior)
-  const result = originalWrite.call(this, chunk, encoding, callback);
-
-  // Also write to file if it's a log message
-  if (typeof chunk === 'string' && chunk.includes('"level"')) {
-    try {
-      const logFile = getLogFileName();
-      fs.appendFileSync(logFile, chunk, 'utf8');
-    } catch (error) {
-      // Ignore file write errors to not break console logging
-    }
-  }
-
-  return result;
-};
+// Use multistream so we log to console AND file without monkey-patching stdout
+const logger = pino(
+  baseOptions,
+  pino.multistream([
+    { stream: process.stdout }, // console
+    { stream: fileStream },     // file
+  ])
+);
 
 export default logger;
