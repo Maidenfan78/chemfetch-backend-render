@@ -9,7 +9,7 @@ router.post('/', async (req, res) => {
   if (!name) return res.status(400).json({ error: 'Missing name' });
 
   try {
-    const { sdsUrl } = await fetchSdsByName(name, size);
+    const { sdsUrl } = await fetchSdsByName(name, size, false, true); // force fresh
     const verified = !!sdsUrl;
     res.json({ sdsUrl, verified });
   } catch (err) {

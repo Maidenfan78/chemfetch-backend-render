@@ -36,11 +36,11 @@ let GOOGLE_SEARCH_ENGINE_ID: string | undefined;
 function getGoogleSearchConfig() {
   if (!GOOGLE_SEARCH_API_KEY) {
     GOOGLE_SEARCH_API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
-    GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID || '45c531108e8b44924';
+    GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID;
 
     // Log only non-sensitive configuration traits
     console.log('[GOOGLE_SEARCH_CONFIG] API Key present:', !!GOOGLE_SEARCH_API_KEY);
-    console.log('[GOOGLE_SEARCH_CONFIG] Search Engine ID:', GOOGLE_SEARCH_ENGINE_ID);
+    console.log('[GOOGLE_SEARCH_CONFIG] Search Engine ID present:', !!GOOGLE_SEARCH_ENGINE_ID);
   }
 
   return { GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID };
@@ -49,7 +49,8 @@ function getGoogleSearchConfig() {
 const BARCODE_CACHE = new TTLCache<string, { name: string; contents_size_weight?: string }>(
   5 * 60 * 1000,
 );
-const SDS_CACHE = new TTLCache<string, string | null>(10 * 60 * 1000);
+// Cache only positive SDS URLs (no negative caching)
+const SDS_CACHE = new TTLCache<string, string>(10 * 60 * 1000);
 
 // -----------------------------------------------------------------------------
 // Axios helpers
@@ -621,13 +622,21 @@ export async function fetchSdsByName(
   name: string,
   size?: string,
   isManualEntry: boolean = false,
+  forceFresh: boolean = false,
 ): Promise<{ sdsUrl: string; topLinks: string[] }> {
-  const cacheKey = size ? `${name}|${size}` : name;
-  const cached = SDS_CACHE.get(cacheKey);
-  if (cached !== undefined) return { sdsUrl: cached || '', topLinks: [] };
+  const normName = (name || '').trim();
+  const normSize = (size || '').trim();
+  const cacheKey = normSize ? `${normName}|${normSize}` : normName;
+  if (!forceFresh) {
+    const cached = SDS_CACHE.get(cacheKey);
+    if (cached && typeof cached === 'string' && cached.length > 0) {
+      console.log(`[SCRAPER] SDS cache hit for key: ${cacheKey}`);
+      return { sdsUrl: cached, topLinks: [] };
+    }
+  }
 
   // Enhanced search strategy with better targeting
-  const baseQuery = `${name} ${size || ''} sds`.trim();
+  const baseQuery = `${normName} ${normSize || ''} sds`.trim();
   console.log(`[SCRAPER] Enhanced search query: ${baseQuery}`);
 
   let hits = await searchAu(baseQuery);
@@ -744,7 +753,6 @@ export async function fetchSdsByName(
   }
 
   console.log('[SCRAPER] No valid SDS PDF found');
-  SDS_CACHE.set(cacheKey, null);
   return { sdsUrl: '', topLinks };
 }
 

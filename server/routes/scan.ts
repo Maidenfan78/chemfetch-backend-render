@@ -158,6 +158,8 @@ router.post('/', async (req, res) => {
           const { sdsUrl: foundSds } = await fetchSdsByName(
             existing.name,
             existing.contents_size_weight || undefined,
+            false,
+            true, // force fresh search to avoid stale negative cache
           );
           logger.info({ name: existing.name, foundSds }, '[SCAN] Fallback SDS result');
           if (foundSds) {
@@ -294,6 +296,8 @@ router.post('/', async (req, res) => {
         const { sdsUrl: fallbackSds, topLinks } = await fetchSdsByName(
           top.name,
           top.size ?? top.contents_size_weight,
+          false,
+          true, // force fresh search for newly scraped product
         );
         const sdsSearchTime = Date.now() - sdsSearchStart;
         logger.info(

@@ -53,6 +53,8 @@ router.post('/', async (req, res) => {
       const { sdsUrl } = await fetchSdsByName(
         product.name,
         product.contents_size_weight || undefined,
+        false,
+        true, // force fresh search to avoid stale negative cache
       );
       if (sdsUrl) {
         const update = await supabase
