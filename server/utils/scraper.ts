@@ -19,8 +19,16 @@ import { TTLCache } from './cache.js';
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36';
+// Prefer backend-specific OCR URL, then fall back to Expo var for dev/mobile, then default
 const OCR_SERVICE_URL =
-  process.env.EXPO_PUBLIC_OCR_API_URL || process.env.OCR_SERVICE_URL || 'http://127.0.0.1:5001';
+  process.env.OCR_SERVICE_URL || process.env.EXPO_PUBLIC_OCR_API_URL || 'http://127.0.0.1:5001';
+
+// Dynamic SDS discovery feature flags
+const ENABLE_DYNAMIC_SDS = String(process.env.ENABLE_DYNAMIC_SDS || 'true').toLowerCase() === 'true';
+const DYNAMIC_SDS_TIMEOUT_MS = Math.max(
+  2000,
+  Number.parseInt(String(process.env.DYNAMIC_SDS_TIMEOUT_MS || '8000'), 10) || 8000,
+);
 
 console.log('[OCR_CONFIG] OCR Service URL:', OCR_SERVICE_URL);
 console.log('[OCR_CONFIG] Available env vars:', {
@@ -28,22 +36,46 @@ console.log('[OCR_CONFIG] Available env vars:', {
   OCR_SERVICE_URL: !!process.env.OCR_SERVICE_URL,
 });
 
-// Google Search API configuration
-// Note: Load environment variables when needed, not at module init
-let GOOGLE_SEARCH_API_KEY: string | undefined;
-let GOOGLE_SEARCH_ENGINE_ID: string | undefined;
+// Google Search API configuration (support multiple fallback credentials)
+type GoogleCred = { key: string; cx: string };
+let GOOGLE_CREDENTIAL_POOL: GoogleCred[] | undefined;
 
-function getGoogleSearchConfig() {
-  if (!GOOGLE_SEARCH_API_KEY) {
-    GOOGLE_SEARCH_API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
-    GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID;
+function loadGoogleCredentialPool(): GoogleCred[] {
+  if (GOOGLE_CREDENTIAL_POOL) return GOOGLE_CREDENTIAL_POOL;
 
-    // Log only non-sensitive configuration traits
-    console.log('[GOOGLE_SEARCH_CONFIG] API Key present:', !!GOOGLE_SEARCH_API_KEY);
-    console.log('[GOOGLE_SEARCH_CONFIG] Search Engine ID present:', !!GOOGLE_SEARCH_ENGINE_ID);
+  const creds: GoogleCred[] = [];
+
+  const pushIfValid = (key?: string, cx?: string) => {
+    if (key && cx) creds.push({ key, cx });
+  };
+
+  // Primary pair
+  pushIfValid(process.env.GOOGLE_SEARCH_API_KEY, process.env.GOOGLE_SEARCH_ENGINE_ID);
+
+  // Indexed alternates: GOOGLE_SEARCH_API_KEY_2, _3, ... with matching ENGINE_IDs
+  for (let i = 2; i <= 5; i++) {
+    pushIfValid(
+      process.env[`GOOGLE_SEARCH_API_KEY_${i}` as keyof NodeJS.ProcessEnv] as string,
+      process.env[`GOOGLE_SEARCH_ENGINE_ID_${i}` as keyof NodeJS.ProcessEnv] as string,
+    );
   }
 
-  return { GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID };
+  // Comma-separated alternates: GOOGLE_SEARCH_API_KEYS and GOOGLE_SEARCH_ENGINE_IDS
+  const keysCsv = process.env.GOOGLE_SEARCH_API_KEYS;
+  const cxsCsv = process.env.GOOGLE_SEARCH_ENGINE_IDS;
+  if (keysCsv && cxsCsv) {
+    const keys = keysCsv.split(',').map(s => s.trim()).filter(Boolean);
+    const cxs = cxsCsv.split(',').map(s => s.trim()).filter(Boolean);
+    const n = Math.min(keys.length, cxs.length);
+    for (let i = 0; i < n; i++) pushIfValid(keys[i], cxs[i]);
+  }
+
+  // Log only non-sensitive configuration traits
+  console.log('[GOOGLE_SEARCH_CONFIG] Loaded credential pairs:', creds.length);
+  creds.forEach((c, idx) => console.log(`[GOOGLE_SEARCH_CONFIG] Pair #${idx + 1}: cx present=${!!c.cx}`));
+
+  GOOGLE_CREDENTIAL_POOL = creds;
+  return GOOGLE_CREDENTIAL_POOL;
 }
 
 const BARCODE_CACHE = new TTLCache<string, { name: string; contents_size_weight?: string }>(
@@ -194,22 +226,25 @@ async function verifySdsUrl(
   }
 }
 
+function isAuUrl(url: string): boolean {
+  try {
+    return detectCountryFromUrl(url) === 'AU';
+  } catch {
+    return false;
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Enhanced Google Search with multiple query strategies
 // -----------------------------------------------------------------------------
-async function fetchGoogleSearchResults(query: string): Promise<{ title: string; url: string }[]> {
-  const { GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID } = getGoogleSearchConfig();
+async function fetchGoogleSearchResults(
+  query: string,
+  opts?: { site?: string },
+): Promise<{ title: string; url: string }[]> {
+  const pool = loadGoogleCredentialPool();
 
-  console.log(`[GOOGLE_SEARCH] API Key check: ${!!GOOGLE_SEARCH_API_KEY}`);
-  console.log(`[GOOGLE_SEARCH] Search Engine ID: ${GOOGLE_SEARCH_ENGINE_ID}`);
-
-  if (!GOOGLE_SEARCH_API_KEY) {
-    console.warn('[GOOGLE_SEARCH] API key not configured, falling back to Bing');
-    return fetchBingLinksRaw(query);
-  }
-
-  if (!GOOGLE_SEARCH_ENGINE_ID || GOOGLE_SEARCH_ENGINE_ID === 'YOUR_SEARCH_ENGINE_ID') {
-    console.warn('[GOOGLE_SEARCH] Search Engine ID not configured properly, falling back to Bing');
+  if (!pool.length) {
+    console.warn('[GOOGLE_SEARCH] No API credentials configured, falling back to Bing');
     return fetchBingLinksRaw(query);
   }
 
@@ -227,30 +262,59 @@ async function fetchGoogleSearchResults(query: string): Promise<{ title: string;
     for (const searchQuery of searchStrategies) {
       console.log(`[GOOGLE_SEARCH] Searching for: ${searchQuery}`);
 
-      // Build search URL with Australian targeting
-      const searchUrl = new URL('https://customsearch.googleapis.com/customsearch/v1');
-      searchUrl.searchParams.set('key', GOOGLE_SEARCH_API_KEY);
-      searchUrl.searchParams.set('cx', GOOGLE_SEARCH_ENGINE_ID);
-      searchUrl.searchParams.set('q', searchQuery);
-      searchUrl.searchParams.set('num', '10'); // Return up to 10 results
-      searchUrl.searchParams.set('gl', 'au'); // Geographic location: Australia
-      searchUrl.searchParams.set('hl', 'en'); // Interface language: English
-      searchUrl.searchParams.set('lr', 'lang_en'); // Language restrict: English
-      searchUrl.searchParams.set('safe', 'off'); // Don't filter results
+      let responseOk = false;
+      let results: any[] = [];
 
-      // Never log secrets: redact the 'key' param before logging
-      const safeUrl = new URL(searchUrl.toString());
-      safeUrl.searchParams.set('key', 'REDACTED');
-      console.log(`[GOOGLE_SEARCH] API URL: ${safeUrl.toString()}`);
+      // Try each credential until one succeeds (or all fail)
+      for (let i = 0; i < pool.length; i++) {
+        const cred = pool[i];
+        // Build search URL with Australian targeting
+        const searchUrl = new URL('https://customsearch.googleapis.com/customsearch/v1');
+        searchUrl.searchParams.set('key', cred.key);
+        searchUrl.searchParams.set('cx', cred.cx);
+        searchUrl.searchParams.set('q', searchQuery);
+        searchUrl.searchParams.set('num', '10'); // Return up to 10 results
+        searchUrl.searchParams.set('gl', 'au'); // Geographic location: Australia
+        searchUrl.searchParams.set('hl', 'en'); // Interface language: English
+        searchUrl.searchParams.set('lr', 'lang_en'); // Language restrict: English
+        searchUrl.searchParams.set('safe', 'off'); // Don't filter results
+        // Optional site scoping for vendor-specific searches
+        if (opts?.site) {
+          searchUrl.searchParams.set('siteSearch', opts.site);
+          searchUrl.searchParams.set('siteSearchFilter', 'i'); // include site
+        }
 
-      const response = await axios.get(searchUrl.toString(), { timeout: 10000 });
+        // Redact key in logs
+        const safeUrl = new URL(searchUrl.toString());
+        safeUrl.searchParams.set('key', 'REDACTED');
+        console.log(`[GOOGLE_SEARCH] Using credential #${i + 1}, API URL: ${safeUrl.toString()}`);
 
-      if (response.status !== 200) {
-        console.error(`[GOOGLE_SEARCH] API returned status ${response.status}:`, response.data);
-        continue; // Try next strategy
+        try {
+          const response = await axios.get(searchUrl.toString(), { timeout: 10000 });
+          if (response.status === 200) {
+            results = response.data?.items || [];
+            responseOk = true;
+            break;
+          } else {
+            console.error(`[GOOGLE_SEARCH] API returned status ${response.status} with cred #${i + 1}:`, response.data);
+            // On 429 or any non-200, try next cred
+          }
+        } catch (err: any) {
+          const status = err?.response?.status;
+          console.error(`[GOOGLE_SEARCH] API error with cred #${i + 1}:`, {
+            message: err?.message,
+            status,
+            data: err?.response?.data,
+          });
+          // Try next credential
+        }
       }
 
-      const results = response.data?.items || [];
+      if (!responseOk) {
+        // No credentials worked for this query, try next query string
+        continue;
+      }
+
       console.log(`[GOOGLE_SEARCH] Found ${results.length} results for query: ${searchQuery}`);
 
       const links = results.map((item: any) => ({
@@ -258,30 +322,28 @@ async function fetchGoogleSearchResults(query: string): Promise<{ title: string;
         url: item.link || '',
       }));
 
-      // Filter out SDS PDFs from early results to prioritize product pages
+      // Split into product pages vs direct SDS/PDF links
       const productResults = links.filter(
         link =>
           !link.url.toLowerCase().endsWith('.pdf') &&
           !link.url.toLowerCase().includes('sds') &&
           !link.url.toLowerCase().includes('msds'),
       );
-
-      allResults = [...allResults, ...productResults];
-
-      // If we found good product pages, stop searching
-      if (productResults.length >= 3) {
-        console.log(`[GOOGLE_SEARCH] Found sufficient product pages, stopping search`);
-        break;
-      }
-
-      // Add back PDF results at the end as fallback
       const pdfResults = links.filter(
         link =>
           link.url.toLowerCase().endsWith('.pdf') ||
           link.url.toLowerCase().includes('sds') ||
           link.url.toLowerCase().includes('msds'),
       );
-      allResults = [...allResults, ...pdfResults];
+
+      // Always include any SDS/PDF candidates found alongside product pages
+      allResults = [...allResults, ...productResults, ...pdfResults];
+
+      // If we found good product pages, we can stop issuing more queries
+      if (productResults.length >= 3) {
+        console.log(`[GOOGLE_SEARCH] Found sufficient product pages, stopping search (PDF results retained)`);
+        break;
+      }
     }
 
     // Remove duplicates while preserving order, then sort by country preference
@@ -296,13 +358,12 @@ async function fetchGoogleSearchResults(query: string): Promise<{ title: string;
     console.log(`[GOOGLE_SEARCH] Final results:`, uniqueResults.slice(0, 5)); // Log first 5 results
     return uniqueResults;
   } catch (error: any) {
-    console.error('[GOOGLE_SEARCH] API error:', {
+    console.error('[GOOGLE_SEARCH] Unexpected error in fetchGoogleSearchResults:', {
       message: error.message,
       status: error.response?.status,
       data: error.response?.data,
     });
-
-    // Fallback to Bing if Google Search fails
+    // Fallback to Bing
     console.log('[GOOGLE_SEARCH] Falling back to Bing search');
     return fetchBingLinksRaw(query);
   }
@@ -344,6 +405,85 @@ export async function searchAu(query: string): Promise<Array<{ title: string; ur
   } catch (e) {
     console.warn('[searchAu] failed:', e);
     return [];
+  }
+}
+
+// Site-scoped AU search for vendor-specific lookups
+async function searchAuSite(query: string, site: string): Promise<Array<{ title: string; url: string }>> {
+  try {
+    return await fetchGoogleSearchResults(query, { site });
+  } catch (e) {
+    console.warn('[searchAuSite] failed:', e);
+    return [];
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Dynamic SDS discovery using headless rendering (generic, vendor-agnostic)
+// -----------------------------------------------------------------------------
+async function dynamicDiscoverPdf(pageUrl: string): Promise<string | null> {
+  if (!ENABLE_DYNAMIC_SDS) return null;
+
+  type LaunchOpts = Parameters<typeof puppeteer.launch>[0];
+  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] } as LaunchOpts);
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(UA);
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-AU,en;q=0.9' });
+
+    const pdfCandidates = new Set<string>();
+
+    page.on('response', async resp => {
+      try {
+        const req = resp.request();
+        const url = req.url();
+        const ct = (resp.headers()['content-type'] || '').toLowerCase();
+        // Accept typical blob storage or octet-stream if URL ends with .pdf
+        if (
+          url.toLowerCase().endsWith('.pdf') &&
+          (ct.includes('application/pdf') || ct.includes('application/octet-stream') || ct === '')
+        ) {
+          pdfCandidates.add(url);
+        }
+      } catch {}
+    });
+
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: DYNAMIC_SDS_TIMEOUT_MS }).catch(() => {});
+    // Give scripts time to run and links to load
+    await page.waitForTimeout(Math.min(1500, DYNAMIC_SDS_TIMEOUT_MS / 2));
+
+    // Also scan DOM links
+    const hrefs: string[] = await page.$$eval('a[href]', as => as.map(a => (a as HTMLAnchorElement).href));
+    for (const h of hrefs) {
+      const s = String(h || '').trim();
+      if (!s) continue;
+      const lower = s.toLowerCase();
+      if (!lower.endsWith('.pdf')) continue;
+      if (
+        /(\b|[-_])(sds|msds)(\b|[-_])/.test(lower) ||
+        /safety[^/\n]*data[^/\n]*sheet/.test(lower)
+      ) {
+        pdfCandidates.add(s);
+      }
+    }
+
+    // Rank AU first
+    const ranked = Array.from(pdfCandidates).sort((a, b) => {
+      const ca = scoreUrlByCountryPreference(a);
+      const cb = scoreUrlByCountryPreference(b);
+      return cb - ca;
+    });
+
+    // Verify headers with our existing helper
+    for (const c of ranked) {
+      const { isPdf, finalUrl } = await isPdfByHeaders(c);
+      if (isPdf) return finalUrl;
+    }
+    return ranked[0] || null;
+  } catch {
+    return null;
+  } finally {
+    await browser.close();
   }
 }
 
@@ -438,21 +578,31 @@ function looksLikeSdsUrl(url: string): boolean {
 }
 
 async function isPdfByHeaders(url: string): Promise<{ isPdf: boolean; finalUrl: string }> {
+  const suffixPdf = url.toLowerCase().endsWith('.pdf');
   try {
     const res = await http.head(url);
     const ct = (res.headers?.['content-type'] || '').toString().toLowerCase();
     const finalUrl = (res.request?.res?.responseUrl as string) || url;
     if (ct.includes('application/pdf')) return { isPdf: true, finalUrl };
+    // Common case: Azure/GCS/S3 return octet-stream for PDFs
+    if (suffixPdf && (ct.includes('application/octet-stream') || ct === '')) {
+      return { isPdf: true, finalUrl };
+    }
     // Some servers lie on HEAD or block it; try a ranged GET for a sniff
     if (res.status >= 400 || !ct) {
       const g = await http.get(url, { responseType: 'arraybuffer' });
       const gCt = (g.headers?.['content-type'] || '').toString().toLowerCase();
       const fUrl = (g.request?.res?.responseUrl as string) || url;
-      return { isPdf: gCt.includes('application/pdf'), finalUrl: fUrl };
+      if (gCt.includes('application/pdf')) return { isPdf: true, finalUrl: fUrl };
+      if (suffixPdf && (gCt.includes('application/octet-stream') || gCt === '')) {
+        return { isPdf: true, finalUrl: fUrl };
+      }
+      return { isPdf: false, finalUrl: fUrl };
     }
     return { isPdf: false, finalUrl };
   } catch {
-    return { isPdf: false, finalUrl: url };
+    // If network sniff fails, trust the .pdf suffix as a last resort
+    return { isPdf: suffixPdf, finalUrl: url };
   }
 }
 
@@ -674,6 +824,9 @@ export async function fetchSdsByName(
 
   const topLinks = prioritizedHits.slice(0, 5).map(h => extractGoogleTarget(h.url));
 
+  // Collect valid non-AU candidates; if AU appears later, prefer it
+  const nonAuFallbacks: string[] = [];
+
   for (const h of prioritizedHits) {
     const url = extractGoogleTarget(h.url);
     console.log(`[SCRAPER] Evaluating link: ${url}`);
@@ -682,14 +835,25 @@ export async function fetchSdsByName(
     // 1) Check if it's a direct PDF link
     if (url.toLowerCase().endsWith('.pdf')) {
       const { isPdf, finalUrl } = await isPdfByHeaders(url);
-      if (isPdf) {
-        console.log('[SCRAPER] Found direct PDF, verifying:', finalUrl);
-        const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
-        if (ok) {
-          console.log('[SCRAPER] Valid SDS PDF found', finalUrl);
-          try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
-          SDS_CACHE.set(cacheKey, finalUrl);
-          return { sdsUrl: finalUrl, topLinks };
+      const sdsLike = looksLikeSdsUrl(finalUrl);
+      if (isPdf || sdsLike) {
+        console.log('[SCRAPER] Found direct PDF (or PDF-like), verifying:', finalUrl);
+        let ok = false;
+        try {
+          ok = await verifySdsUrl(finalUrl, name, isManualEntry);
+        } catch {
+          ok = false;
+        }
+        if (ok || sdsLike) {
+          if (isAuUrl(finalUrl)) {
+            console.log('[SCRAPER] Valid AU SDS PDF selected', finalUrl);
+            try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
+            SDS_CACHE.set(cacheKey, finalUrl);
+            return { sdsUrl: finalUrl, topLinks };
+          } else {
+            console.log('[SCRAPER] Non-AU valid SDS candidate queued', finalUrl);
+            nonAuFallbacks.push(finalUrl);
+          }
         }
       }
     }
@@ -716,10 +880,35 @@ export async function fetchSdsByName(
         console.log('[SCRAPER] Found PDF via page scan, verifying:', pdf);
         const ok = await verifySdsUrl(pdf, name, isManualEntry);
         if (ok) {
-          console.log('[SCRAPER] Valid SDS PDF via page hop', pdf);
-          try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(pdf)); } catch {}
-          SDS_CACHE.set(cacheKey, pdf);
-          return { sdsUrl: pdf, topLinks };
+          if (isAuUrl(pdf)) {
+            console.log('[SCRAPER] Valid AU SDS PDF via page hop', pdf);
+            try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(pdf)); } catch {}
+            SDS_CACHE.set(cacheKey, pdf);
+            return { sdsUrl: pdf, topLinks };
+          } else {
+            console.log('[SCRAPER] Non-AU valid SDS candidate via page hop queued', pdf);
+            nonAuFallbacks.push(pdf);
+          }
+        }
+      }
+    }
+
+    // 4) Dynamic fallback: headless render to capture PDF downloads (generic)
+    if (!url.toLowerCase().endsWith('.pdf') && ENABLE_DYNAMIC_SDS) {
+      const dyn = await dynamicDiscoverPdf(url);
+      if (dyn) {
+        console.log('[SCRAPER] Dynamic discovery found PDF:', dyn);
+        const okDyn = await verifySdsUrl(dyn, name, isManualEntry);
+        if (okDyn) {
+          if (isAuUrl(dyn)) {
+            console.log('[SCRAPER] Valid AU SDS PDF via dynamic discovery', dyn);
+            try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(dyn)); } catch {}
+            SDS_CACHE.set(cacheKey, dyn);
+            return { sdsUrl: dyn, topLinks };
+          } else {
+            console.log('[SCRAPER] Non-AU valid SDS candidate via dynamic discovery queued', dyn);
+            nonAuFallbacks.push(dyn);
+          }
         }
       }
     }
@@ -727,6 +916,83 @@ export async function fetchSdsByName(
 
   // Try more specific searches if nothing found yet
   console.log('[SCRAPER] No valid SDS found in initial search, trying alternative strategies');
+
+  // Vendor-specific, AU-first: Würth Australia
+  try {
+    const isWurth = /\bw(u|ü)rth\b/i.test(normName);
+    if (isWurth) {
+      console.log('[SCRAPER] Detected Würth product, trying site-scoped search on wurth.com.au');
+      const vendorQueries = [
+        `${normName} ${normSize} sds`.trim(),
+        `${normName} safety data sheet`.trim(),
+        `${normName} pdf sds`.trim(),
+      ];
+
+      // Domains to try for Würth AU
+      const wurthSites = ['www.wurth.com.au', 'eshop.wurth.com.au'];
+
+      // 1) Try wurth.com.au domains first
+      for (const q of vendorQueries) {
+        for (const site of wurthSites) {
+          const siteHits = await searchAuSite(q, site);
+          for (const h of siteHits.slice(0, 6)) {
+            const url = extractGoogleTarget(h.url);
+            // Direct PDF
+            if (url.toLowerCase().endsWith('.pdf')) {
+              const { isPdf, finalUrl } = await isPdfByHeaders(url);
+              if (isPdf) {
+                const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
+                if (ok && isAuUrl(finalUrl)) {
+                  console.log('[SCRAPER] Würth AU SDS found via site-scoped search', finalUrl);
+                  try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
+                  SDS_CACHE.set(cacheKey, finalUrl);
+                  return { sdsUrl: finalUrl, topLinks };
+                } else if (ok) {
+                  // Queue as non-AU fallback if nothing AU turns up
+                  nonAuFallbacks.push(finalUrl);
+                }
+              }
+            }
+            // Not a direct PDF: try HTML discovery and dynamic discovery
+            if (!url.toLowerCase().endsWith('.pdf') && !isProbablyHome(url)) {
+              const pdf = (await discoverPdfOnHtmlPage(url)) || (ENABLE_DYNAMIC_SDS ? await dynamicDiscoverPdf(url) : null);
+              if (pdf) {
+                const ok = await verifySdsUrl(pdf, name, isManualEntry);
+                if (ok && isAuUrl(pdf)) {
+                  console.log('[SCRAPER] Würth AU SDS discovered from product page', pdf);
+                  try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(pdf)); } catch {}
+                  SDS_CACHE.set(cacheKey, pdf);
+                  return { sdsUrl: pdf, topLinks };
+                } else if (ok) {
+                  nonAuFallbacks.push(pdf);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // 2) Try global Würth media host (some AU PDFs are hosted there)
+      console.log('[SCRAPER] Trying site-scoped search on media.wuerth.com');
+      for (const q of vendorQueries) {
+        const siteHits = await searchAuSite(q, 'media.wuerth.com');
+        for (const h of siteHits.slice(0, 6)) {
+          const url = extractGoogleTarget(h.url);
+          const { isPdf, finalUrl } = await isPdfByHeaders(url);
+          if (isPdf) {
+            const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
+            if (ok) {
+              // media.wuerth.com is global; accept as fallback if AU not found
+              console.log('[SCRAPER] Würth SDS found on media.wuerth.com (global host)', finalUrl);
+              nonAuFallbacks.push(finalUrl);
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('[SCRAPER] Würth site-scoped lookup failed:', e);
+  }
 
   // Manufacturer-specific search as a fallback
   const manufacturerQuery = `"${name}" manufacturer safety data sheet Australia`;
@@ -742,17 +1008,31 @@ export async function fetchSdsByName(
       if (isPdf) {
         const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
         if (ok) {
-          console.log('[SCRAPER] Valid SDS PDF found via manufacturer search', finalUrl);
-          SDS_CACHE.set(cacheKey, finalUrl);
-          // Preserve existing top links if we had any; otherwise return the found PDF
-          const resultTopLinks = topLinks.length > 0 ? topLinks : [finalUrl];
-          return { sdsUrl: finalUrl, topLinks: resultTopLinks };
+          if (isAuUrl(finalUrl)) {
+            console.log('[SCRAPER] Valid AU SDS PDF via manufacturer search', finalUrl);
+            SDS_CACHE.set(cacheKey, finalUrl);
+            const resultTopLinks = topLinks.length > 0 ? topLinks : [finalUrl];
+            return { sdsUrl: finalUrl, topLinks: resultTopLinks };
+          } else {
+            console.log('[SCRAPER] Non-AU valid SDS candidate via manufacturer search queued', finalUrl);
+            nonAuFallbacks.push(finalUrl);
+          }
         }
       }
     }
   }
 
-  console.log('[SCRAPER] No valid SDS PDF found');
+  // If we collected any non-AU candidates, return the best one now
+  if (nonAuFallbacks.length > 0) {
+    // Prefer by AU scoring anyway (e.g., NZ over UK if AU missing)
+    nonAuFallbacks.sort((a, b) => scoreUrlByCountryPreference(b) - scoreUrlByCountryPreference(a));
+    const chosen = nonAuFallbacks[0];
+    console.log('[SCRAPER] Returning best non-AU SDS candidate after exhausting AU options:', chosen);
+    SDS_CACHE.set(cacheKey, chosen);
+    return { sdsUrl: chosen, topLinks };
+  }
+
+  console.log(`[SCRAPER] No valid SDS PDF found for "${normName}"${normSize ? ` size "${normSize}"` : ''}`);
   return { sdsUrl: '', topLinks };
 }
 
