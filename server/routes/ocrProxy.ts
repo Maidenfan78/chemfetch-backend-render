@@ -1,53 +1,45 @@
-// server/routes/ocrProxy.ts
 import { Router } from 'express';
 import { createProxyMiddleware } from 'http-proxy-middleware';
 import dotenv from 'dotenv';
+import logger from '../utils/logger.js';
 
 dotenv.config();
 
-/**
- * Forwards multipart `/ocr` POST requests to the Python service.
- * The proxy streams the body so we don’t need extra middleware.
- */
 const OCR_SERVICE_URL = process.env.OCR_SERVICE_URL || 'http://localhost:5001';
+
 const router = Router();
 
-const proxyOptions = {
+const proxy = createProxyMiddleware({
   target: OCR_SERVICE_URL,
   changeOrigin: true,
-  pathRewrite: () => '/ocr', // always forward as /ocr
-
-  onProxyReq: (proxyReq, req, res) => {
-    console.log(
-      '[OCR Proxy ▶︎ Python]',
-      new Date().toISOString(),
-      'method:',
-      proxyReq.method,
-      'path:',
-      proxyReq.path,
-      'content-type:',
-      proxyReq.getHeader('content-type'),
-      'content-length:',
-      proxyReq.getHeader('content-length'),
+  pathRewrite: () => '/ocr',
+  onProxyReq: proxyReq => {
+    logger.debug(
+      {
+        method: proxyReq.method,
+        path: proxyReq.path,
+        headers: {
+          'content-type': proxyReq.getHeader('content-type'),
+          'content-length': proxyReq.getHeader('content-length'),
+        },
+      },
+      '[OCR Proxy] Forwarding request',
     );
   },
-
-  onProxyRes: (proxyRes, req, res) => {
-    console.log(
-      '[OCR Python ◀︎ Proxy]',
-      new Date().toISOString(),
-      'status:',
-      proxyRes.statusCode,
-      'headers:',
-      proxyRes.headers,
+  onProxyRes: proxyRes => {
+    logger.debug(
+      {
+        statusCode: proxyRes.statusCode,
+        headers: proxyRes.headers,
+      },
+      '[OCR Proxy] Response received',
     );
   },
-
   headers: {
     'X-Forwarded-By': 'chemfetch-backend',
   },
-};
+} as any);
 
-router.use('/', createProxyMiddleware(proxyOptions));
+router.use('/', proxy);
 
 export default router;

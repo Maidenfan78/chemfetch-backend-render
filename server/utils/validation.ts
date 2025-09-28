@@ -1,13 +1,15 @@
-export function isValidCode(code: any): code is string {
+export function isValidCode(code: unknown): code is string {
   return typeof code === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(code);
 }
 
-export function isValidName(name: any): name is string {
+export function isValidName(name: unknown): name is string {
   if (typeof name !== 'string') return false;
-  return name.trim().length > 0 && name.length <= 100;
+  const trimmed = name.trim();
+  return trimmed.length > 0 && trimmed.length <= 100;
 }
 
-export function isValidSize(size: any): size is string {
+export function isValidSize(size: unknown): size is string {
   if (typeof size !== 'string') return false;
-  return size.trim().length > 0 && size.length <= 50;
+  const trimmed = size.trim();
+  return trimmed.length > 0 && trimmed.length <= 50;
 }

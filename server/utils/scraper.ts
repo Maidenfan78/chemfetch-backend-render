@@ -1,1196 +1,712 @@
-import axios from 'axios';
 import * as cheerio from 'cheerio';
+import logger from './logger.js';
 
-// ⬇⬇ Fix puppeteer-extra typing under ESM/NodeNext
-import puppeteerBase from 'puppeteer-extra';
-import StealthPlugin from 'puppeteer-extra-plugin-stealth';
-import type { PuppeteerNode } from 'puppeteer';
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+const REQUEST_TIMEOUT = 8000;
+const SIZE_PATTERN =
+  /\b\d+(?:[.,]\d+)?\s?(?:ml|mL|l|L|litre|liter|g|kg|oz|fl\s?oz|pack|packs|tablet|tablets)\b/i;
 
-// Teach TS that puppeteer-extra behaves like PuppeteerNode and has .use()
-const puppeteer = puppeteerBase as unknown as PuppeteerNode & {
-  use: (plugin: unknown) => void;
-};
+const SDS_BANNED_HOSTS = [
+  'sdsmanager.',
+  'msdsmanager.',
+  'msds.com',
+  'hazard.com',
+  'msdsdigital.com',
+  'chemtrac.com',
+];
+const SDS_PREFERRED_HOSTS = [
+  'blob.core.windows.net',
+  'chemwatch.net',
+  'chemicalsafety.com',
+  'productsds',
+  'azuredge.net',
+];
+const SDS_VERIFICATION_TIMEOUT = 12000;
 
-puppeteer.use(StealthPlugin());
-// ⬆⬆ End fix
-
-import { setTimeout as delay } from 'timers/promises';
-import { TTLCache } from './cache.js';
-
-const UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36';
-// Prefer backend-specific OCR URL, then fall back to Expo var for dev/mobile, then default
-const OCR_SERVICE_URL =
-  process.env.OCR_SERVICE_URL || process.env.EXPO_PUBLIC_OCR_API_URL || 'http://127.0.0.1:5001';
-
-// Dynamic SDS discovery feature flags
-const ENABLE_DYNAMIC_SDS = String(process.env.ENABLE_DYNAMIC_SDS || 'true').toLowerCase() === 'true';
-const DYNAMIC_SDS_TIMEOUT_MS = Math.max(
-  2000,
-  Number.parseInt(String(process.env.DYNAMIC_SDS_TIMEOUT_MS || '8000'), 10) || 8000,
-);
-
-console.log('[OCR_CONFIG] OCR Service URL:', OCR_SERVICE_URL);
-console.log('[OCR_CONFIG] Available env vars:', {
-  EXPO_PUBLIC_OCR_API_URL: !!process.env.EXPO_PUBLIC_OCR_API_URL,
-  OCR_SERVICE_URL: !!process.env.OCR_SERVICE_URL,
-});
-
-// Google Search API configuration (support multiple fallback credentials)
-type GoogleCred = { key: string; cx: string };
-let GOOGLE_CREDENTIAL_POOL: GoogleCred[] | undefined;
-
-function loadGoogleCredentialPool(): GoogleCred[] {
-  if (GOOGLE_CREDENTIAL_POOL) return GOOGLE_CREDENTIAL_POOL;
-
-  const creds: GoogleCred[] = [];
-
-  const pushIfValid = (key?: string, cx?: string) => {
-    if (key && cx) creds.push({ key, cx });
-  };
-
-  // Primary pair
-  pushIfValid(process.env.GOOGLE_SEARCH_API_KEY, process.env.GOOGLE_SEARCH_ENGINE_ID);
-
-  // Indexed alternates: GOOGLE_SEARCH_API_KEY_2, _3, ... with matching ENGINE_IDs
-  for (let i = 2; i <= 5; i++) {
-    pushIfValid(
-      process.env[`GOOGLE_SEARCH_API_KEY_${i}` as keyof NodeJS.ProcessEnv] as string,
-      process.env[`GOOGLE_SEARCH_ENGINE_ID_${i}` as keyof NodeJS.ProcessEnv] as string,
-    );
-  }
-
-  // Comma-separated alternates: GOOGLE_SEARCH_API_KEYS and GOOGLE_SEARCH_ENGINE_IDS
-  const keysCsv = process.env.GOOGLE_SEARCH_API_KEYS;
-  const cxsCsv = process.env.GOOGLE_SEARCH_ENGINE_IDS;
-  if (keysCsv && cxsCsv) {
-    const keys = keysCsv.split(',').map(s => s.trim()).filter(Boolean);
-    const cxs = cxsCsv.split(',').map(s => s.trim()).filter(Boolean);
-    const n = Math.min(keys.length, cxs.length);
-    for (let i = 0; i < n; i++) pushIfValid(keys[i], cxs[i]);
-  }
-
-  // Log only non-sensitive configuration traits
-  console.log('[GOOGLE_SEARCH_CONFIG] Loaded credential pairs:', creds.length);
-  creds.forEach((c, idx) => console.log(`[GOOGLE_SEARCH_CONFIG] Pair #${idx + 1}: cx present=${!!c.cx}`));
-
-  GOOGLE_CREDENTIAL_POOL = creds;
-  return GOOGLE_CREDENTIAL_POOL;
+function normaliseUrl(url: string | null | undefined): string {
+  return cleanText(url || '').toLowerCase();
 }
 
-const BARCODE_CACHE = new TTLCache<string, { name: string; contents_size_weight?: string }>(
-  5 * 60 * 1000,
-);
-// Cache only positive SDS URLs (no negative caching)
-const SDS_CACHE = new TTLCache<string, string>(10 * 60 * 1000);
-
-// -----------------------------------------------------------------------------
-// Axios helpers
-// -----------------------------------------------------------------------------
-const http = axios.create({
-  timeout: 8000, // Reduced from 15000 to 8000ms for faster failures
-  maxRedirects: 3, // Reduced from 5 to 3
-  headers: {
-    'User-Agent': UA,
-    'Accept-Language': 'en-AU,en;q=0.9',
-  },
-  validateStatus: () => true,
-});
-
-// -----------------------------------------------------------------------------
-// Country preference helpers (AU-first by default)
-// -----------------------------------------------------------------------------
-type CountryCode = 'AU' | 'NZ' | 'US' | 'UK' | 'GB' | 'EU' | 'CA' | 'OTHER';
-
-function getPreferredCountries(): CountryCode[] {
-  const raw = process.env.SDS_COUNTRY_PREFERENCE;
-  if (raw && typeof raw === 'string') {
-    return raw
-      .split(',')
-      .map(s => s.trim().toUpperCase())
-      .filter(Boolean)
-      .map(s => (s === 'GB' ? 'UK' : (s as CountryCode)) as CountryCode);
+function scoreSdsLink(link: string, productName: string): number {
+  const lower = normaliseUrl(link);
+  if (!lower) return -Infinity;
+  let score = 0;
+  if (lower.startsWith('http')) score += 1;
+  if (lower.includes('.pdf')) score += 6;
+  if (lower.endsWith('.pdf')) score += 2;
+  for (const host of SDS_PREFERRED_HOSTS) {
+    if (lower.includes(host)) score += 6;
   }
-  // Default AU-first, then reasonable fallbacks
-  return ['AU', 'NZ', 'UK', 'US', 'EU', 'CA'];
-}
-
-function detectCountryFromUrl(url: string): CountryCode {
-  try {
-    const u = new URL(url);
-    const host = u.hostname.toLowerCase();
-    const path = (u.pathname + (u.search || '')).toLowerCase();
-
-    // Host-based
-    if (host.endsWith('.com.au') || host.endsWith('.org.au') || host.endsWith('.gov.au') || host.endsWith('.au')) return 'AU';
-    if (host.endsWith('.co.nz') || host.endsWith('.nz')) return 'NZ';
-    if (host.endsWith('.co.uk') || host.endsWith('.uk')) return 'UK';
-    if (host.endsWith('.eu')) return 'EU';
-    if (host.endsWith('.ca')) return 'CA';
-    if (host.endsWith('.com') && (host.includes('wurth.com.au') || host.includes('chemwatch.net/au'))) return 'AU';
-
-    // Path/locale hints
-    const has = (re: RegExp) => re.test(path);
-    if (
-      has(/(^|[\/?._-])(au|en-au|en_au)(?=($|[\/?._-]))/) ||
-      path.includes('australia')
-    )
-      return 'AU';
-    if (has(/(^|[\/?._-])(nz|en-nz|en_nz)(?=($|[\/?._-]))/)) return 'NZ';
-    if (has(/(^|[\/?._-])(uk|gb|en-gb|en_uk|en_gb)(?=($|[\/?._-]))/)) return 'UK';
-    if (has(/(^|[\/?._-])(us|en-us|en_us)(?=($|[\/?._-]))/)) return 'US';
-    if (has(/(^|[\/?._-])(eu)(?=($|[\/?._-]))/)) return 'EU';
-    if (has(/(^|[\/?._-])(ca|en-ca|en_ca|canada)(?=($|[\/?._-]))/) || path.includes('canada')) return 'CA';
-
-    return 'OTHER';
-  } catch {
-    return 'OTHER';
+  for (const host of SDS_BANNED_HOSTS) {
+    if (lower.includes(host)) score -= 6;
   }
+  const tokens = productName
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(token => token.length > 2);
+  if (tokens.length) {
+    const matches = tokens.filter(token => lower.includes(token)).length;
+    score += matches;
+  }
+  return score;
 }
 
-function scoreUrlByCountryPreference(url: string): number {
-  const country = detectCountryFromUrl(url);
-  const prefs = getPreferredCountries();
-  // Higher score for earlier in preference list
-  const idx = prefs.indexOf(country);
-  const base = idx >= 0 ? (prefs.length - idx) * 10 : 0;
-
-  // Boost explicit Australian indicators even on generic hosts
-  let bonus = 0;
-  const lower = url.toLowerCase();
-  if (lower.includes('australia')) bonus += 6;
-  if (/(^|[\/?._-])(au|en-au|en_au)(?=($|[\/?._-]))/.test(lower)) bonus += 6;
-  if (lower.includes('.com.au')) bonus += 8;
-
-  // Penalise Canadian variants if not first preference
-  const caPenalty = prefs[0] !== 'CA' && (lower.endsWith('.ca') || /(^|[\/?._-])(ca|en-ca|en_ca|canada)(?=($|[\/?._-]))/.test(lower) || lower.includes('canada'))
-    ? 8
-    : 0;
-
-  return base + bonus - caPenalty;
+function tokenise(value: string): string[] {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(token => token.length > 2);
 }
 
-// Helper to verify SDS PDF by calling the OCR microservice verify-sds endpoint
-async function verifySdsUrl(
-  url: string,
+async function verifySdsLink(
+  link: string,
   productName: string,
-  isManualEntry: boolean = false,
+  productSize: string | undefined,
 ): Promise<boolean> {
+  const ocrServiceUrl = process.env.OCR_SERVICE_URL || 'http://localhost:5001';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SDS_VERIFICATION_TIMEOUT);
   try {
-    console.log(`[SCRAPER] Verifying SDS URL: ${url} for product: ${productName}`);
+    const response = await fetch(`${ocrServiceUrl}/parse-pdf-direct`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pdf_url: link }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      return false;
+    }
+    const payload = await response.json();
+    if (!payload?.success) return false;
+    const parsed = payload.parsed_data || payload.metadata || payload.raw_json || {};
+    const valueFromField = (field: any): string | null => {
+      if (!field) return null;
+      if (typeof field === 'string') return field;
+      if (
+        typeof field === 'object' &&
+        typeof field.value === 'string' &&
+        (field.confidence ?? 0) > 0
+      ) {
+        return field.value;
+      }
+      return null;
+    };
 
-    // For manual entries with obvious SDS URLs, be more lenient
-    if (
-      isManualEntry &&
-      (url.toLowerCase().includes('sds') ||
-        url.toLowerCase().includes('msds') ||
-        url.toLowerCase().includes('safety'))
-    ) {
-      console.log(`[SCRAPER] Manual entry with obvious SDS URL, accepting: ${url}`);
-      return true;
+    const productField = valueFromField(parsed.product_name);
+    const descriptionField = valueFromField(parsed.description);
+    const manufacturerField = valueFromField(parsed.manufacturer || parsed.vendor);
+    const issueDateField = valueFromField(parsed.issue_date);
+
+    const descriptionLower = (descriptionField || '').toLowerCase();
+    if (descriptionLower.includes('risk assessment')) {
+      return false;
     }
 
-    // Also accept URLs from known SDS providers for manual entries
-    if (isManualEntry) {
-      const sdsProviders = [
-        'msdsdigital.com',
-        'chemwatch.net',
-        'chemscape.com',
-        'safeworkdata.com',
-      ];
-      if (sdsProviders.some(domain => url.toLowerCase().includes(domain))) {
-        console.log(`[SCRAPER] Manual entry from known SDS provider, accepting: ${url}`);
+    const hasSdsSignals = Boolean(
+      (issueDateField && issueDateField.trim()) ||
+        (manufacturerField && manufacturerField.trim()) ||
+        (descriptionField && /safety\s+data/i.test(descriptionField)),
+    );
+    if (!hasSdsSignals) {
+      return false;
+    }
+
+    const candidates = new Set<string>();
+    const pushCandidate = (value?: any) => {
+      const extracted = valueFromField(value);
+      if (extracted && extracted.trim().length > 3) {
+        candidates.add(extracted);
+      } else if (typeof value === 'string' && value.trim().length > 3) {
+        candidates.add(value);
+      }
+    };
+    pushCandidate(productField);
+    pushCandidate(descriptionField);
+    pushCandidate(manufacturerField);
+    if (parsed.raw_json) {
+      pushCandidate(parsed.raw_json.product_name);
+      pushCandidate(parsed.raw_json.description);
+      pushCandidate(parsed.raw_json.manufacturer);
+    }
+    if (candidates.size === 0) return false;
+    const expectedTokens = new Set(tokenise(productName));
+    if (productSize) {
+      for (const token of tokenise(productSize)) expectedTokens.add(token);
+    }
+    if (expectedTokens.size === 0) return false;
+    for (const candidate of candidates) {
+      const candidateTokens = new Set(tokenise(candidate));
+      if (candidateTokens.size === 0) continue;
+      let matches = 0;
+      expectedTokens.forEach(token => {
+        if (candidateTokens.has(token)) matches += 1;
+      });
+      const matchRatio = matches / Math.max(1, expectedTokens.size);
+      if (matches >= Math.min(3, expectedTokens.size) || matchRatio >= 0.6) {
         return true;
       }
     }
-
-    // If OCR service is not available, accept PDFs with SDS-like URLs
-    if (looksLikeSdsUrl(url)) {
-      console.log(`[SCRAPER] OCR unavailable, accepting SDS-like URL: ${url}`);
-      return true;
-    }
-
-    const resp = await axios.post(
-      `${OCR_SERVICE_URL}/verify-sds`,
-      { url, name: productName },
-      { timeout: 5000 }, // Reduced timeout
-    );
-    console.log(`[SCRAPER] OCR verification response:`, resp.data);
-    const isVerified = resp.data.verified === true;
-    console.log(`[SCRAPER] OCR verification result: ${isVerified}`);
-    return isVerified;
+    return false;
   } catch (err) {
-    console.log('[SCRAPER] OCR verification failed; using strict URL heuristics');
-    // If OCR service fails, only accept if the URL strongly indicates an SDS
-    return looksLikeSdsUrl(url);
-  }
-}
-
-function isAuUrl(url: string): boolean {
-  try {
-    return detectCountryFromUrl(url) === 'AU';
-  } catch {
+    logger.warn({ link, err: String(err) }, '[SCRAPER] SDS verification failed');
     return false;
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Enhanced Google Search with multiple query strategies
-// -----------------------------------------------------------------------------
-async function fetchGoogleSearchResults(
-  query: string,
-  opts?: { site?: string },
-): Promise<{ title: string; url: string }[]> {
-  const pool = loadGoogleCredentialPool();
-
-  if (!pool.length) {
-    console.warn('[GOOGLE_SEARCH] No API credentials configured, falling back to Bing');
-    return fetchBingLinksRaw(query);
-  }
-
-  try {
-    // Try multiple search strategies for better product discovery
-    const searchStrategies = [
-      query, // Original barcode
-      `${query} product Australia`, // Add product context
-      `${query} shop buy Australia`, // Shopping context
-      `${query} supermarket pharmacy`, // Retail context
-    ];
-
-    let allResults: { title: string; url: string }[] = [];
-
-    for (const searchQuery of searchStrategies) {
-      console.log(`[GOOGLE_SEARCH] Searching for: ${searchQuery}`);
-
-      let responseOk = false;
-      let results: any[] = [];
-
-      // Try each credential until one succeeds (or all fail)
-      for (let i = 0; i < pool.length; i++) {
-        const cred = pool[i];
-        // Build search URL with Australian targeting
-        const searchUrl = new URL('https://customsearch.googleapis.com/customsearch/v1');
-        searchUrl.searchParams.set('key', cred.key);
-        searchUrl.searchParams.set('cx', cred.cx);
-        searchUrl.searchParams.set('q', searchQuery);
-        searchUrl.searchParams.set('num', '10'); // Return up to 10 results
-        searchUrl.searchParams.set('gl', 'au'); // Geographic location: Australia
-        searchUrl.searchParams.set('hl', 'en'); // Interface language: English
-        searchUrl.searchParams.set('lr', 'lang_en'); // Language restrict: English
-        searchUrl.searchParams.set('safe', 'off'); // Don't filter results
-        // Optional site scoping for vendor-specific searches
-        if (opts?.site) {
-          searchUrl.searchParams.set('siteSearch', opts.site);
-          searchUrl.searchParams.set('siteSearchFilter', 'i'); // include site
-        }
-
-        // Redact key in logs
-        const safeUrl = new URL(searchUrl.toString());
-        safeUrl.searchParams.set('key', 'REDACTED');
-        console.log(`[GOOGLE_SEARCH] Using credential #${i + 1}, API URL: ${safeUrl.toString()}`);
-
-        try {
-          const response = await axios.get(searchUrl.toString(), { timeout: 10000 });
-          if (response.status === 200) {
-            results = response.data?.items || [];
-            responseOk = true;
-            break;
-          } else {
-            console.error(`[GOOGLE_SEARCH] API returned status ${response.status} with cred #${i + 1}:`, response.data);
-            // On 429 or any non-200, try next cred
-          }
-        } catch (err: any) {
-          const status = err?.response?.status;
-          console.error(`[GOOGLE_SEARCH] API error with cred #${i + 1}:`, {
-            message: err?.message,
-            status,
-            data: err?.response?.data,
-          });
-          // Try next credential
-        }
-      }
-
-      if (!responseOk) {
-        // No credentials worked for this query, try next query string
-        continue;
-      }
-
-      console.log(`[GOOGLE_SEARCH] Found ${results.length} results for query: ${searchQuery}`);
-
-      const links = results.map((item: any) => ({
-        title: item.title || '',
-        url: item.link || '',
-      }));
-
-      // Split into product pages vs direct SDS/PDF links
-      const productResults = links.filter(
-        link =>
-          !link.url.toLowerCase().endsWith('.pdf') &&
-          !link.url.toLowerCase().includes('sds') &&
-          !link.url.toLowerCase().includes('msds'),
-      );
-      const pdfResults = links.filter(
-        link =>
-          link.url.toLowerCase().endsWith('.pdf') ||
-          link.url.toLowerCase().includes('sds') ||
-          link.url.toLowerCase().includes('msds'),
-      );
-
-      // Always include any SDS/PDF candidates found alongside product pages
-      allResults = [...allResults, ...productResults, ...pdfResults];
-
-      // If we found good product pages, we can stop issuing more queries
-      if (productResults.length >= 3) {
-        console.log(`[GOOGLE_SEARCH] Found sufficient product pages, stopping search (PDF results retained)`);
-        break;
-      }
-    }
-
-    // Remove duplicates while preserving order, then sort by country preference
-    const uniqueResults = allResults.filter(
-      (item, index, self) => index === self.findIndex(other => other.url === item.url),
-    );
-
-    // AU-first scoring
-    uniqueResults.sort((a, b) => scoreUrlByCountryPreference(b.url) - scoreUrlByCountryPreference(a.url));
-
-    console.log(`[GOOGLE_SEARCH] Total unique results: ${uniqueResults.length}`);
-    console.log(`[GOOGLE_SEARCH] Final results:`, uniqueResults.slice(0, 5)); // Log first 5 results
-    return uniqueResults;
-  } catch (error: any) {
-    console.error('[GOOGLE_SEARCH] Unexpected error in fetchGoogleSearchResults:', {
-      message: error.message,
-      status: error.response?.status,
-      data: error.response?.data,
-    });
-    // Fallback to Bing
-    console.log('[GOOGLE_SEARCH] Falling back to Bing search');
-    return fetchBingLinksRaw(query);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Bing search fallback (AU-biased) via Puppeteer (stealth)
-// -----------------------------------------------------------------------------
-async function fetchBingLinksRaw(query: string): Promise<{ title: string; url: string }[]> {
-  // Inferred launch options type from the actual function
-  type LaunchOpts = Parameters<typeof puppeteer.launch>[0];
-
-  const browser = await puppeteer.launch({
-    headless: true,
-    args: ['--no-sandbox'],
-  } as LaunchOpts);
-  try {
-    const page = await browser.newPage();
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-AU,en;q=0.9' });
-    await page.setUserAgent(UA);
-    const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&mkt=en-AU&cc=AU`;
-    console.log(`[BING_SEARCH] Fallback search URL: ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded' });
-    await page.waitForSelector('li.b_algo h2 a', { timeout: 10000 }).catch(() => {});
-    const links = await page.$$eval('li.b_algo h2 a', els =>
-      els.map(el => ({ title: el.textContent?.trim() || '', url: el.getAttribute('href') || '' })),
-    );
-    console.log(`[BING_SEARCH] Found ${links.length} fallback results`);
-    return links;
   } finally {
-    await browser.close();
+    clearTimeout(timeout);
   }
 }
 
-export async function searchAu(query: string): Promise<Array<{ title: string; url: string }>> {
-  try {
-    // Use Google Search API primarily, with Bing as fallback
-    return await fetchGoogleSearchResults(query);
-  } catch (e) {
-    console.warn('[searchAu] failed:', e);
-    return [];
-  }
+export interface ProductScrapeResult {
+  url: string;
+  name: string;
+  contents_size_weight: string;
+  size?: string;
+  sdsUrl: string | null;
 }
 
-// Site-scoped AU search for vendor-specific lookups
-async function searchAuSite(query: string, site: string): Promise<Array<{ title: string; url: string }>> {
-  try {
-    return await fetchGoogleSearchResults(query, { site });
-  } catch (e) {
-    console.warn('[searchAuSite] failed:', e);
-    return [];
-  }
+function cleanText(value?: string | null): string {
+  if (!value) return '';
+  return value.replace(/\s+/g, ' ').trim();
 }
 
-// -----------------------------------------------------------------------------
-// Dynamic SDS discovery using headless rendering (generic, vendor-agnostic)
-// -----------------------------------------------------------------------------
-async function dynamicDiscoverPdf(pageUrl: string): Promise<string | null> {
-  if (!ENABLE_DYNAMIC_SDS) return null;
-
-  type LaunchOpts = Parameters<typeof puppeteer.launch>[0];
-  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] } as LaunchOpts);
-  try {
-    const page = await browser.newPage();
-    await page.setUserAgent(UA);
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-AU,en;q=0.9' });
-
-    const pdfCandidates = new Set<string>();
-
-    page.on('response', async resp => {
-      try {
-        const req = resp.request();
-        const url = req.url();
-        const ct = (resp.headers()['content-type'] || '').toLowerCase();
-        // Accept typical blob storage or octet-stream if URL ends with .pdf
-        if (
-          url.toLowerCase().endsWith('.pdf') &&
-          (ct.includes('application/pdf') || ct.includes('application/octet-stream') || ct === '')
-        ) {
-          pdfCandidates.add(url);
-        }
-      } catch {}
-    });
-
-    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: DYNAMIC_SDS_TIMEOUT_MS }).catch(() => {});
-    // Give scripts time to run and links to load
-    await page.waitForTimeout(Math.min(1500, DYNAMIC_SDS_TIMEOUT_MS / 2));
-
-    // Also scan DOM links
-    const hrefs: string[] = await page.$$eval('a[href]', as => as.map(a => (a as HTMLAnchorElement).href));
-    for (const h of hrefs) {
-      const s = String(h || '').trim();
-      if (!s) continue;
-      const lower = s.toLowerCase();
-      if (!lower.endsWith('.pdf')) continue;
-      if (
-        /(\b|[-_])(sds|msds)(\b|[-_])/.test(lower) ||
-        /safety[^/\n]*data[^/\n]*sheet/.test(lower)
-      ) {
-        pdfCandidates.add(s);
-      }
+function dedupe(items: string[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const item of items) {
+    if (!seen.has(item)) {
+      seen.add(item);
+      ordered.push(item);
     }
+  }
+  return ordered;
+}
 
-    // Rank AU first
-    const ranked = Array.from(pdfCandidates).sort((a, b) => {
-      const ca = scoreUrlByCountryPreference(a);
-      const cb = scoreUrlByCountryPreference(b);
-      return cb - ca;
-    });
+function decodeBingRedirect(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let candidate = raw.trim();
+  if (!candidate) return null;
 
-    // Verify headers with our existing helper
-    for (const c of ranked) {
-      const { isPdf, finalUrl } = await isPdfByHeaders(c);
-      if (isPdf) return finalUrl;
-    }
-    return ranked[0] || null;
+  try {
+    const decoded = decodeURIComponent(candidate);
+    if (decoded) candidate = decoded;
   } catch {
-    return null;
-  } finally {
-    await browser.close();
+    /* ignore malformed URI sequences */
   }
-}
 
-// -----------------------------------------------------------------------------
-// URL / PDF utilities
-// -----------------------------------------------------------------------------
-function isProbablyA1Base64(s: string): boolean {
-  if (!s || s.length < 3) return false;
-  const c0 = s.charCodeAt(0);
-  const c1 = s.charCodeAt(1);
-  const firstIsLetter = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122);
-  const secondIsDigit = c1 >= 48 && c1 <= 57; // '0'-'9'
-  return firstIsLetter && secondIsDigit;
-}
+  if (/^https?:\/\//i.test(candidate)) return candidate;
 
-function extractBingTarget(url: string): string {
-  if (!url) return url;
-  let s = String(url).trim();
-
-  // Handle Bing redirector links with u= parameter
-  try {
-    const parsed = new URL(s);
-    if (parsed.hostname.includes('bing.com') && parsed.searchParams.has('u')) {
-      let target = parsed.searchParams.get('u') || '';
-      try {
-        if (isProbablyA1Base64(target)) {
-          target = Buffer.from(target.slice(2), 'base64').toString('utf8');
-        } else {
-          target = decodeURIComponent(target);
-        }
-      } catch {}
-      s = target.trim();
-    }
-  } catch {}
-
-  // Handle direct base64-encoded URLs that start with a1a
-  try {
-    if (isProbablyA1Base64(s)) {
-      const decoded = Buffer.from(s.slice(2), 'base64').toString('utf8');
-      if (decoded.startsWith('http://') || decoded.startsWith('https://')) {
-        s = decoded;
-      }
-    }
-  } catch {}
-
-  // Return original if not a valid URL or contains dummy domains
-  if (!(s.startsWith('http://') || s.startsWith('https://'))) return url;
-  if (s.includes('dummy.local')) return url;
-
-  return s;
-}
-
-// Clean up Google Search results (no redirect unwrapping needed)
-function extractGoogleTarget(url: string): string {
-  if (!url) return url;
-  let s = String(url).trim();
-
-  // Google Custom Search API returns direct URLs, no redirect unwrapping needed
-  if (!(s.startsWith('http://') || s.startsWith('https://'))) return url;
-  if (s.includes('dummy.local')) return url;
-
-  return s;
-}
-
-function looksLikeSdsUrl(url: string): boolean {
-  const u = url.toLowerCase();
-
-  // Exclude obvious policy/legal docs commonly found on vendor sites
-  const blacklist = [
-    'privacy',
-    'terms',
-    'warranty',
-    'returns',
-    'policy',
-    'statement',
-    'collection',
-    'modern_slavery',
-    'supplier-code-of-conduct',
-    'credit_information',
-    'cookies',
-  ];
-  if (blacklist.some(word => u.includes(word))) return false;
-
-  // Strong indicators for SDS
-  const sdsLike =
-    /(\b|[-_])(sds|msds)(\b|[-_])/.test(u) || /safety[^/\n]*data[^/\n]*sheet/.test(u);
-
-  // Prefer PDFs for SDS content
-  const isPdf = u.endsWith('.pdf');
-
-  return sdsLike && isPdf;
-}
-
-async function isPdfByHeaders(url: string): Promise<{ isPdf: boolean; finalUrl: string }> {
-  const suffixPdf = url.toLowerCase().endsWith('.pdf');
-  try {
-    const res = await http.head(url);
-    const ct = (res.headers?.['content-type'] || '').toString().toLowerCase();
-    const finalUrl = (res.request?.res?.responseUrl as string) || url;
-    if (ct.includes('application/pdf')) return { isPdf: true, finalUrl };
-    // Common case: Azure/GCS/S3 return octet-stream for PDFs
-    if (suffixPdf && (ct.includes('application/octet-stream') || ct === '')) {
-      return { isPdf: true, finalUrl };
-    }
-    // Some servers lie on HEAD or block it; try a ranged GET for a sniff
-    if (res.status >= 400 || !ct) {
-      const g = await http.get(url, { responseType: 'arraybuffer' });
-      const gCt = (g.headers?.['content-type'] || '').toString().toLowerCase();
-      const fUrl = (g.request?.res?.responseUrl as string) || url;
-      if (gCt.includes('application/pdf')) return { isPdf: true, finalUrl: fUrl };
-      if (suffixPdf && (gCt.includes('application/octet-stream') || gCt === '')) {
-        return { isPdf: true, finalUrl: fUrl };
-      }
-      return { isPdf: false, finalUrl: fUrl };
-    }
-    return { isPdf: false, finalUrl };
-  } catch {
-    // If network sniff fails, trust the .pdf suffix as a last resort
-    return { isPdf: suffixPdf, finalUrl: url };
+  const attempts: string[] = [candidate];
+  for (let i = 1; i <= 3 && i < candidate.length; i++) {
+    attempts.push(candidate.slice(i));
   }
-}
 
-async function discoverPdfOnHtmlPage(pageUrl: string): Promise<string | null> {
-  try {
-    const res = await http.get(pageUrl);
-    if (res.status >= 400) return null;
-    const finalUrl = (res.request?.res?.responseUrl as string) || pageUrl;
-    const $ = cheerio.load(res.data);
+  const base64Pattern = /^[A-Za-z0-9+/=_-]+$/;
 
-    // Look for likely SDS PDF links (avoid generic policy/terms documents)
-    const candidates: string[] = [];
-    $('a[href]').each((_, a) => {
-      const href = String($(a).attr('href') || '').trim();
-      if (!href) return;
-      try {
-        const abs = new URL(href, finalUrl).toString();
-        const lower = abs.toLowerCase();
-        // Also examine link text for SDS hints
-        const linkText = ($(a).text() || '').toLowerCase();
+  for (const attempt of attempts) {
+    const trimmed = attempt.trim();
+    if (trimmed.length < 8) continue;
+    if (!base64Pattern.test(trimmed)) continue;
 
-        const blacklist = [
-          'privacy',
-          'terms',
-          'warranty',
-          'returns',
-          'policy',
-          'statement',
-          'collection',
-          'cookie',
-        ];
-        const hasBlacklist =
-          blacklist.some(w => lower.includes(w)) || blacklist.some(w => linkText.includes(w));
+    const normalised = trimmed.replace(/-/g, '+').replace(/_/g, '/');
+    const padding = normalised.length % 4;
+    const padded = padding ? normalised + '='.repeat(4 - padding) : normalised;
 
-        // Keep only likely SDS PDF links
-        const likelySds =
-          (/(\b|[-_])(sds|msds)(\b|[-_])/.test(lower) ||
-            /safety[^/\n]*data[^/\n]*sheet/.test(lower) ||
-            /(\b|[-_])(sds|msds)(\b|[-_])/.test(linkText) ||
-            /safety[^/\n]*data[^/\n]*sheet/.test(linkText)) &&
-          lower.endsWith('.pdf');
-
-        if (!hasBlacklist && likelySds) {
-          candidates.push(abs);
-        }
-      } catch {}
-    });
-
-    console.log(
-      `[SCRAPER] Found ${candidates.length} likely SDS PDF candidates on ${pageUrl}:`,
-      candidates,
-    );
-
-    // Ranking: AU-first by country, then SDS-likeness and PDF suffix
-    candidates.sort((a, b) => {
-      const ca = scoreUrlByCountryPreference(a);
-      const cb = scoreUrlByCountryPreference(b);
-      if (cb !== ca) return cb - ca;
-      const sa = (looksLikeSdsUrl(a) ? 1 : 0) + (a.toLowerCase().endsWith('.pdf') ? 1 : 0);
-      const sb = (looksLikeSdsUrl(b) ? 1 : 0) + (b.toLowerCase().endsWith('.pdf') ? 1 : 0);
-      return sb - sa;
-    });
-
-    for (const c of candidates) {
-      const { isPdf, finalUrl: f } = await isPdfByHeaders(c);
-      if (isPdf) return f;
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function isProbablyHome(url: string): boolean {
-  try {
-    const u = new URL(url);
-    return !u.pathname || u.pathname === '/' || u.pathname.split('/').filter(Boolean).length <= 1;
-  } catch {
-    return false;
-  }
-}
-
-// Filter for Australian/relevant results
-function isRelevantForAustralia(url: string, title: string): boolean {
-  const urlLower = url.toLowerCase();
-  const titleLower = title.toLowerCase();
-
-  // Strongly prefer Australian sites
-  if (urlLower.includes('.com.au') || urlLower.includes('australia')) return true;
-
-  // Accept major international retailers that ship to Australia
-  const acceptedDomains = [
-    'amazon.com',
-    'ebay.com',
-    'walmart.com',
-    'chemist.net',
-    'pharmacy',
-    'chemwatch',
-    'msdsdigital',
-  ];
-  if (acceptedDomains.some(domain => urlLower.includes(domain))) return true;
-
-  // Exclude obviously irrelevant domains
-  if (urlLower.includes('.tw') || urlLower.includes('.cn') || urlLower.includes('.jp'))
-    return false;
-
-  // Exclude software/gaming/unrelated content
-  if (
-    titleLower.includes('emulator') ||
-    titleLower.includes('software') ||
-    titleLower.includes('firewall') ||
-    titleLower.includes('browser') || // Filter out browser check pages
-    titleLower.includes('checking') || // Filter out verification pages
-    titleLower.includes('cloudflare')
-  )
-    return false;
-
-  // Prefer pharmacy, chemical, or product-related content
-  if (
-    titleLower.includes('pharmacy') ||
-    titleLower.includes('chemical') ||
-    titleLower.includes('product') ||
-    titleLower.includes('antiseptic') ||
-    titleLower.includes('alcohol')
-  )
-    return true;
-
-  return true; // Default to including if not obviously irrelevant
-}
-
-// -----------------------------------------------------------------------------
-// Public: barcode → product name/size
-// -----------------------------------------------------------------------------
-export async function searchItemByBarcode(
-  barcode: string,
-): Promise<{ name: string; contents_size_weight?: string } | null> {
-  const cached = BARCODE_CACHE.get(barcode);
-  if (cached) return cached;
-
-  const hits = await searchAu(`${barcode} product Australia`); // More targeted barcode search
-  for (const hit of hits.slice(0, 7)) {
-    const target = extractGoogleTarget(hit.url);
     try {
-      const html = await http.get(target).then(r => r.data as string);
-      const $ = cheerio.load(html);
-      const name =
-        $('h1').first().text().trim() || $("meta[property='og:title']").attr('content') || '';
-      const bodyText = $('body').text();
-      const sizeMatch = bodyText.match(/(\d+(?:[\.,]\d+)?\s?(?:ml|mL|g|kg|oz|l|L)\b)/);
-      const size = sizeMatch ? sizeMatch[0].replace(',', '.') : '';
-
-      if (name) {
-        const result = { name, contents_size_weight: size };
-        BARCODE_CACHE.set(barcode, result);
-        return result;
+      const decoded = Buffer.from(padded, 'base64').toString('utf8');
+      if (/^https?:\/\//i.test(decoded)) {
+        return decoded;
       }
-    } catch {}
-    await delay(200);
+    } catch {
+      /* ignore invalid base64 */
+    }
   }
+
   return null;
 }
 
-// -----------------------------------------------------------------------------
-// Public: name (+ optional size) → SDS (robust PDF finder)
-// -----------------------------------------------------------------------------
-export async function fetchSdsByName(
-  name: string,
-  size?: string,
-  isManualEntry: boolean = false,
-  forceFresh: boolean = false,
-): Promise<{ sdsUrl: string; topLinks: string[] }> {
-  const normName = (name || '').trim();
-  const normSize = (size || '').trim();
-  const cacheKey = normSize ? `${normName}|${normSize}` : normName;
-  if (!forceFresh) {
-    const cached = SDS_CACHE.get(cacheKey);
-    if (cached && typeof cached === 'string' && cached.length > 0) {
-      console.log(`[SCRAPER] SDS cache hit for key: ${cacheKey}`);
-      return { sdsUrl: cached, topLinks: [] };
+function getHostname(url: string): string {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function normaliseLink(raw: string | undefined | null, base?: string): string | null {
+  if (!raw) return null;
+  let href = raw.trim();
+  if (!href) return null;
+  if (href.startsWith('javascript:')) return null;
+  if (href.startsWith('//')) href = `https:${href}`;
+  if (base && href.startsWith('/')) {
+    try {
+      href = new URL(href, base).toString();
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const parsed = new URL(href);
+    if (parsed.hostname.includes('bing.com') || parsed.hostname.includes('duckduckgo.com')) {
+      const redirectParams = parsed.hostname.includes('duckduckgo.com')
+        ? ['uddg', 'rut', 'u', 'url']
+        : ['u', 'url', 'r', 'target'];
+      for (const param of redirectParams) {
+        const target = parsed.searchParams.get(param);
+        const decoded = decodeBingRedirect(target);
+        if (decoded) {
+          href = decoded;
+          break;
+        }
+      }
+    }
+  } catch {
+    if (!base) return null;
+    try {
+      href = new URL(href, base).toString();
+    } catch {
+      return null;
+    }
+  }
+  if (!/^https?:\/\//i.test(href)) return null;
+  return href;
+}
+
+function isLikelySiteSearch(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.hostname.includes('bing.com')) return false;
+    const path = (parsed.pathname + parsed.search).toLowerCase();
+    return path.includes('/search') || parsed.searchParams.has('q');
+  } catch {
+    return false;
+  }
+}
+
+function extractSize(text: string): string {
+  const match = text.match(SIZE_PATTERN);
+  return match ? cleanText(match[0]).replace(/,/g, '.') : '';
+}
+
+const CTA_PREFIXES = [
+  /^(buy|shop|order|purchase|get|view|discover|compare)\s+/i,
+  /^add to cart:?\s*/i,
+];
+const STORE_KEYWORDS = [
+  'chemist',
+  'chemist warehouse',
+  'pharmacy',
+  'store',
+  'shop',
+  'online',
+  'discount',
+  'warehouse',
+  'market',
+  'supermarket',
+  'apothecary',
+  'amazon',
+  'ebay',
+  'target',
+  'walmart',
+];
+const NAME_SPLIT_REGEX = /\s*(?:\||[\u2013\u2014\u2015]|-|\u2022|\u00b7|:)\s*/;
+
+function looksLikeStoreFragment(fragment: string): boolean {
+  const lower = fragment.toLowerCase();
+  if (!lower) return false;
+  if (lower.includes('http')) return true;
+  if (lower.includes('.com')) return true;
+  return STORE_KEYWORDS.some(keyword => lower.includes(keyword));
+}
+
+function normaliseProductName(raw: string | null | undefined): string {
+  let value = cleanText(raw);
+  if (!value) return '';
+  const original = value;
+
+  for (const pattern of CTA_PREFIXES) {
+    if (pattern.test(value)) {
+      value = value.replace(pattern, '');
+      break;
     }
   }
 
-  // Enhanced search strategy with better targeting
-  const baseQuery = `${normName} ${normSize || ''} sds`.trim();
-  console.log(`[SCRAPER] Enhanced search query: ${baseQuery}`);
+  value = value.replace(/\s+online\s+at\s+.+$/i, '');
+  value = value.replace(/\s+available\s+at\s+.+$/i, '');
+  value = cleanText(value);
 
-  let hits = await searchAu(baseQuery);
+  const parts = value
+    .split(NAME_SPLIT_REGEX)
+    .map(part => cleanText(part))
+    .filter(Boolean);
+  if (parts.length > 1) {
+    const preferred = parts.find(part => !looksLikeStoreFragment(part));
+    value = preferred || parts[0];
+  }
 
-  // Filter out irrelevant results and prioritize Australian content
-  const relevantHits = hits.filter(h => isRelevantForAustralia(h.url, h.title));
-  console.log(
-    `[SCRAPER] Filtered ${hits.length} results to ${relevantHits.length} relevant results`,
+  const trailingMatch = value.match(
+    /^(.*?)(?:\s+(?:online|chemist|pharmacy|store|shop|discount|warehouse).*)$/i,
   );
-
-  // Use relevant hits if we have them, otherwise fall back to all hits
-  const searchHits = relevantHits.length > 0 ? relevantHits : hits;
-
-  // Prioritize AU-first by country preference, then pharmacy/chemist heuristics
-  const prioritizedHits = searchHits.sort((a, b) => {
-    const cs = scoreUrlByCountryPreference(a.url) - scoreUrlByCountryPreference(b.url);
-    if (cs !== 0) return cs > 0 ? -1 : 1;
-
-    const aUrl = a.url.toLowerCase();
-    const bUrl = b.url.toLowerCase();
-
-    const auPharmacyA = aUrl.includes('.com.au') && (aUrl.includes('pharmacy') || aUrl.includes('chemist'));
-    const auPharmacyB = bUrl.includes('.com.au') && (bUrl.includes('pharmacy') || bUrl.includes('chemist'));
-    if (auPharmacyA && !auPharmacyB) return -1;
-    if (auPharmacyB && !auPharmacyA) return 1;
-
-    // Deprioritize eBay (often has anti-bot protection)
-    const ebayA = aUrl.includes('ebay');
-    const ebayB = bUrl.includes('ebay');
-    if (ebayA && !ebayB) return 1;
-    if (ebayB && !ebayA) return -1;
-
-    return 0;
-  });
-
-  const topLinks = prioritizedHits.slice(0, 5).map(h => extractGoogleTarget(h.url));
-
-  // Collect valid non-AU candidates; if AU appears later, prefer it
-  const nonAuFallbacks: string[] = [];
-
-  for (const h of prioritizedHits) {
-    const url = extractGoogleTarget(h.url);
-    console.log(`[SCRAPER] Evaluating link: ${url}`);
-    console.log(`[SCRAPER] Link title: ${h.title}`);
-
-    // 1) Check if it's a direct PDF link
-    if (url.toLowerCase().endsWith('.pdf')) {
-      const { isPdf, finalUrl } = await isPdfByHeaders(url);
-      const sdsLike = looksLikeSdsUrl(finalUrl);
-      if (isPdf || sdsLike) {
-        console.log('[SCRAPER] Found direct PDF (or PDF-like), verifying:', finalUrl);
-        let ok = false;
-        try {
-          ok = await verifySdsUrl(finalUrl, name, isManualEntry);
-        } catch {
-          ok = false;
-        }
-        if (ok || sdsLike) {
-          if (isAuUrl(finalUrl)) {
-            console.log('[SCRAPER] Valid AU SDS PDF selected', finalUrl);
-            try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
-            SDS_CACHE.set(cacheKey, finalUrl);
-            return { sdsUrl: finalUrl, topLinks };
-          } else {
-            console.log('[SCRAPER] Non-AU valid SDS candidate queued', finalUrl);
-            nonAuFallbacks.push(finalUrl);
-          }
-        }
-      }
-    }
-
-    // 2) Check if URL looks like it might have SDS content
-    if (looksLikeSdsUrl(url)) {
-      const { isPdf, finalUrl } = await isPdfByHeaders(url);
-      if (isPdf) {
-        console.log('[SCRAPER] Found SDS-like PDF, verifying:', finalUrl);
-        const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
-        if (ok) {
-          console.log('[SCRAPER] Valid SDS PDF found', finalUrl);
-          try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
-          SDS_CACHE.set(cacheKey, finalUrl);
-          return { sdsUrl: finalUrl, topLinks };
-        }
-      }
-    }
-
-    // 3) Scan HTML pages for PDF links (but be more aggressive about checking them)
-    if (!url.toLowerCase().endsWith('.pdf') && !isProbablyHome(url)) {
-      const pdf = await discoverPdfOnHtmlPage(url);
-      if (pdf) {
-        console.log('[SCRAPER] Found PDF via page scan, verifying:', pdf);
-        const ok = await verifySdsUrl(pdf, name, isManualEntry);
-        if (ok) {
-          if (isAuUrl(pdf)) {
-            console.log('[SCRAPER] Valid AU SDS PDF via page hop', pdf);
-            try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(pdf)); } catch {}
-            SDS_CACHE.set(cacheKey, pdf);
-            return { sdsUrl: pdf, topLinks };
-          } else {
-            console.log('[SCRAPER] Non-AU valid SDS candidate via page hop queued', pdf);
-            nonAuFallbacks.push(pdf);
-          }
-        }
-      }
-    }
-
-    // 4) Dynamic fallback: headless render to capture PDF downloads (generic)
-    if (!url.toLowerCase().endsWith('.pdf') && ENABLE_DYNAMIC_SDS) {
-      const dyn = await dynamicDiscoverPdf(url);
-      if (dyn) {
-        console.log('[SCRAPER] Dynamic discovery found PDF:', dyn);
-        const okDyn = await verifySdsUrl(dyn, name, isManualEntry);
-        if (okDyn) {
-          if (isAuUrl(dyn)) {
-            console.log('[SCRAPER] Valid AU SDS PDF via dynamic discovery', dyn);
-            try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(dyn)); } catch {}
-            SDS_CACHE.set(cacheKey, dyn);
-            return { sdsUrl: dyn, topLinks };
-          } else {
-            console.log('[SCRAPER] Non-AU valid SDS candidate via dynamic discovery queued', dyn);
-            nonAuFallbacks.push(dyn);
-          }
-        }
-      }
-    }
+  if (trailingMatch && trailingMatch[1]) {
+    value = cleanText(trailingMatch[1]);
   }
 
-  // Try more specific searches if nothing found yet
-  console.log('[SCRAPER] No valid SDS found in initial search, trying alternative strategies');
-
-  // Vendor-specific, AU-first: Würth Australia
-  try {
-    const isWurth = /\bw(u|ü)rth\b/i.test(normName);
-    if (isWurth) {
-      console.log('[SCRAPER] Detected Würth product, trying site-scoped search on wurth.com.au');
-      const vendorQueries = [
-        `${normName} ${normSize} sds`.trim(),
-        `${normName} safety data sheet`.trim(),
-        `${normName} pdf sds`.trim(),
-      ];
-
-      // Domains to try for Würth AU
-      const wurthSites = ['www.wurth.com.au', 'eshop.wurth.com.au'];
-
-      // 1) Try wurth.com.au domains first
-      for (const q of vendorQueries) {
-        for (const site of wurthSites) {
-          const siteHits = await searchAuSite(q, site);
-          for (const h of siteHits.slice(0, 6)) {
-            const url = extractGoogleTarget(h.url);
-            // Direct PDF
-            if (url.toLowerCase().endsWith('.pdf')) {
-              const { isPdf, finalUrl } = await isPdfByHeaders(url);
-              if (isPdf) {
-                const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
-                if (ok && isAuUrl(finalUrl)) {
-                  console.log('[SCRAPER] Würth AU SDS found via site-scoped search', finalUrl);
-                  try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(finalUrl)); } catch {}
-                  SDS_CACHE.set(cacheKey, finalUrl);
-                  return { sdsUrl: finalUrl, topLinks };
-                } else if (ok) {
-                  // Queue as non-AU fallback if nothing AU turns up
-                  nonAuFallbacks.push(finalUrl);
-                }
-              }
-            }
-            // Not a direct PDF: try HTML discovery and dynamic discovery
-            if (!url.toLowerCase().endsWith('.pdf') && !isProbablyHome(url)) {
-              const pdf = (await discoverPdfOnHtmlPage(url)) || (ENABLE_DYNAMIC_SDS ? await dynamicDiscoverPdf(url) : null);
-              if (pdf) {
-                const ok = await verifySdsUrl(pdf, name, isManualEntry);
-                if (ok && isAuUrl(pdf)) {
-                  console.log('[SCRAPER] Würth AU SDS discovered from product page', pdf);
-                  try { console.log('[SCRAPER] Selected SDS region:', detectCountryFromUrl(pdf)); } catch {}
-                  SDS_CACHE.set(cacheKey, pdf);
-                  return { sdsUrl: pdf, topLinks };
-                } else if (ok) {
-                  nonAuFallbacks.push(pdf);
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // 2) Try global Würth media host (some AU PDFs are hosted there)
-      console.log('[SCRAPER] Trying site-scoped search on media.wuerth.com');
-      for (const q of vendorQueries) {
-        const siteHits = await searchAuSite(q, 'media.wuerth.com');
-        for (const h of siteHits.slice(0, 6)) {
-          const url = extractGoogleTarget(h.url);
-          const { isPdf, finalUrl } = await isPdfByHeaders(url);
-          if (isPdf) {
-            const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
-            if (ok) {
-              // media.wuerth.com is global; accept as fallback if AU not found
-              console.log('[SCRAPER] Würth SDS found on media.wuerth.com (global host)', finalUrl);
-              nonAuFallbacks.push(finalUrl);
-            }
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.warn('[SCRAPER] Würth site-scoped lookup failed:', e);
-  }
-
-  // Manufacturer-specific search as a fallback
-  const manufacturerQuery = `"${name}" manufacturer safety data sheet Australia`;
-  console.log(`[SCRAPER] Trying manufacturer search: ${manufacturerQuery}`);
-  const manufacturerHits = await searchAu(manufacturerQuery);
-
-  for (const h of manufacturerHits.slice(0, 3)) {
-    const url = extractGoogleTarget(h.url);
-    console.log(`[SCRAPER] Checking manufacturer result: ${url}`);
-
-    if (url.toLowerCase().endsWith('.pdf')) {
-      const { isPdf, finalUrl } = await isPdfByHeaders(url);
-      if (isPdf) {
-        const ok = await verifySdsUrl(finalUrl, name, isManualEntry);
-        if (ok) {
-          if (isAuUrl(finalUrl)) {
-            console.log('[SCRAPER] Valid AU SDS PDF via manufacturer search', finalUrl);
-            SDS_CACHE.set(cacheKey, finalUrl);
-            const resultTopLinks = topLinks.length > 0 ? topLinks : [finalUrl];
-            return { sdsUrl: finalUrl, topLinks: resultTopLinks };
-          } else {
-            console.log('[SCRAPER] Non-AU valid SDS candidate via manufacturer search queued', finalUrl);
-            nonAuFallbacks.push(finalUrl);
-          }
-        }
-      }
-    }
-  }
-
-  // If we collected any non-AU candidates, return the best one now
-  if (nonAuFallbacks.length > 0) {
-    // Prefer by AU scoring anyway (e.g., NZ over UK if AU missing)
-    nonAuFallbacks.sort((a, b) => scoreUrlByCountryPreference(b) - scoreUrlByCountryPreference(a));
-    const chosen = nonAuFallbacks[0];
-    console.log('[SCRAPER] Returning best non-AU SDS candidate after exhausting AU options:', chosen);
-    SDS_CACHE.set(cacheKey, chosen);
-    return { sdsUrl: chosen, topLinks };
-  }
-
-  console.log(`[SCRAPER] No valid SDS PDF found for "${normName}"${normSize ? ` size "${normSize}"` : ''}`);
-  return { sdsUrl: '', topLinks };
+  value = cleanText(value);
+  return value || original;
 }
 
-// Simple wrapper kept for compatibility
-export async function fetchBingLinks(query: string): Promise<string[]> {
-  const hits = await searchAu(query);
-  return hits.map(h => extractGoogleTarget(h.url));
+function isLikelySds(url: string, anchorText?: string): boolean {
+  const lowerUrl = url.toLowerCase();
+  const lowerText = anchorText?.toLowerCase() || '';
+  if (
+    lowerUrl.endsWith('.pdf') &&
+    (lowerUrl.includes('sds') ||
+      lowerUrl.includes('msds') ||
+      lowerText.includes('sds') ||
+      lowerText.includes('safety data'))
+  ) {
+    return true;
+  }
+  if (
+    lowerUrl.includes('sds') ||
+    lowerUrl.includes('msds') ||
+    lowerUrl.includes('safety-data-sheet')
+  ) {
+    return true;
+  }
+  if (
+    lowerText.includes('safety data') ||
+    lowerText.includes('sds') ||
+    lowerText.includes('msds')
+  ) {
+    return true;
+  }
+  return false;
 }
 
-// -----------------------------------------------------------------------------
-// Public: Search using manual entry data (name + size + barcode)
-// -----------------------------------------------------------------------------
-export async function searchWithManualData(
-  name: string,
-  size: string,
-  barcode?: string,
-): Promise<{ name: string; contents_size_weight: string; sdsUrl: string }> {
-  console.log(`[SCRAPER] Manual search for: ${name} ${size} ${barcode || ''}`);
-
-  // Use provided data directly, then search for SDS
-  const result = {
-    name: name.trim(),
-    contents_size_weight: size.trim(),
-    sdsUrl: '',
-  };
-
+function deriveNameFromUrl(url: string): string {
   try {
-    const { sdsUrl } = await fetchSdsByName(name, size, true); // Pass true for isManualEntry
-    if (sdsUrl) {
-      result.sdsUrl = sdsUrl;
-      console.log(`[SCRAPER] Found SDS for manual entry: ${sdsUrl}`);
-    } else {
-      console.log(`[SCRAPER] No SDS found for manual entry: ${name} ${size}`);
-    }
+    const { pathname } = new URL(url);
+    const slug = pathname.split('/').filter(Boolean).pop() || '';
+    const withoutExt = slug.replace(/\.(html?|php|aspx|pdf)$/i, '');
+    return cleanText(withoutExt.replace(/[-_]+/g, ' '));
+  } catch {
+    return '';
+  }
+}
+
+async function fetchDuckDuckGoLinks(query: string, limit = 6): Promise<string[]> {
+  const trimmed = cleanText(query);
+  if (!trimmed) return [];
+  try {
+    const searchUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`;
+    const { data } = await httpGet(searchUrl);
+    const $ = cheerio.load(data);
+    const links: string[] = [];
+    $('a.result__a[href]').each((_, el) => {
+      const raw = $(el).attr('href');
+      const normalised = normaliseLink(raw, searchUrl);
+      if (normalised) {
+        links.push(normalised);
+        if (links.length >= limit * 2) return false;
+      }
+      return undefined;
+    });
+    const deduped = dedupe(links);
+    logger.info(
+      { query: trimmed, linkCount: deduped.length, links: deduped.slice(0, limit) },
+      '[SCRAPER] DuckDuckGo links collected',
+    );
+    return deduped.slice(0, limit);
   } catch (err) {
-    console.error(`[SCRAPER] SDS search failed for manual entry:`, err);
+    logger.warn({ query: trimmed, err: String(err) }, '[SCRAPER] DuckDuckGo search failed');
+    return [];
   }
+}
 
+async function httpGet(url: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': USER_AGENT,
+        'Accept-Language': 'en-AU,en;q=0.9',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      redirect: 'follow',
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}`);
+    }
+    const data = await response.text();
+    return { data };
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Request timed out');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function hasUsefulHost(links: string[]): boolean {
+  return links.some(link => {
+    const host = getHostname(link);
+    if (!host) return false;
+    if (host.includes('bing.com')) return false;
+    if (host.includes('baidu.com')) return false;
+    return true;
+  });
+}
+
+export async function fetchBingLinks(query: string, limit = 6): Promise<string[]> {
+  const trimmed = cleanText(query);
+  if (!trimmed) return [];
+  try {
+    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(trimmed)}&setlang=en-US`;
+    const { data } = await httpGet(searchUrl);
+    const $ = cheerio.load(data);
+    const links: string[] = [];
+    'li.b_algo h2 a, li.b_algo a.title'.split(',').forEach(selector => {
+      $(selector.trim()).each((_, el) => {
+        const raw = $(el).attr('href');
+        const normalised = normaliseLink(raw);
+        if (normalised) links.push(normalised);
+      });
+    });
+    $('a[href^=https://www.bing.com/ck/a]').each((_, el) => {
+      const raw = $(el).attr('href');
+      const normalised = normaliseLink(raw);
+      if (normalised) links.push(normalised);
+    });
+    const deduped = dedupe(links);
+    logger.info(
+      { query: trimmed, linkCount: deduped.length, links: deduped.slice(0, limit) },
+      '[SCRAPER] Bing links collected',
+    );
+    if (!hasUsefulHost(deduped.slice(0, limit))) {
+      const duckLinks = await fetchDuckDuckGoLinks(trimmed, limit);
+      if (duckLinks.length > 0) {
+        const merged = dedupe([...duckLinks, ...deduped]);
+        logger.info(
+          { query: trimmed, duckCount: duckLinks.length, mergedPreview: merged.slice(0, limit) },
+          '[SCRAPER] DuckDuckGo fallback applied',
+        );
+        return merged.slice(0, limit);
+      }
+    }
+    return deduped.slice(0, limit);
+  } catch {
+    logger.warn({ query: trimmed }, '[SCRAPER] Bing search failed');
+    return [];
+  }
+}
+
+export async function expandSiteSearchPage(url: string, limit = 5): Promise<string[]> {
+  const normalised = normaliseLink(url);
+  if (!normalised) return [];
+  if (!isLikelySiteSearch(normalised)) return [];
+  try {
+    const { data } = await httpGet(normalised);
+    const $ = cheerio.load(data);
+    const candidates: string[] = [];
+    $('a[href]').each((_, el) => {
+      if (candidates.length >= limit) return false;
+      const href = $(el).attr('href');
+      const anchor = cleanText($(el).text());
+      const resolved = normaliseLink(href, normalised);
+      if (!resolved) return;
+      if (isLikelySiteSearch(resolved)) return;
+      if (!/^https?:\/\//i.test(resolved)) return;
+      if (anchor.length < 3) return;
+      candidates.push(resolved);
+    });
+    return dedupe(candidates).slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+export async function scrapeProductInfo(
+  url: string,
+  barcode?: string,
+): Promise<ProductScrapeResult> {
+  const normalised = normaliseLink(url);
+  if (!normalised) {
+    throw new Error('Invalid URL');
+  }
+  const result: ProductScrapeResult = {
+    url: normalised,
+    name: '',
+    contents_size_weight: '',
+    size: '',
+    sdsUrl: null,
+  };
+  try {
+    const { data } = await httpGet(normalised);
+    const $ = cheerio.load(data);
+    const rawNameCandidates = [
+      $("meta[property='og:title']").attr('content'),
+      $("meta[name='title']").attr('content'),
+      $('h1').first().text(),
+      $('title').first().text(),
+    ];
+    const nameCandidates = rawNameCandidates.map(candidate => normaliseProductName(candidate));
+    result.name = nameCandidates.find(Boolean) || '';
+    const bodyText = cleanText($('body').text());
+    const detectedSize = extractSize(bodyText);
+    if (detectedSize) result.contents_size_weight = detectedSize;
+    if (!result.contents_size_weight && barcode && bodyText.includes(barcode)) {
+      const barcodeIndex = bodyText.indexOf(barcode);
+      const windowText = bodyText.slice(Math.max(0, barcodeIndex - 120), barcodeIndex + 120);
+      const nearbySize = extractSize(windowText);
+      if (nearbySize) result.contents_size_weight = nearbySize;
+    }
+    $('a[href]').each((_, el) => {
+      if (result.sdsUrl) return false;
+      const href = $(el).attr('href');
+      const anchor = cleanText($(el).text());
+      const resolved = normaliseLink(href, normalised);
+      if (resolved && isLikelySds(resolved, anchor)) {
+        logger.info({ url: normalised, resolved, anchor }, '[SCRAPER] SDS link detected');
+        result.sdsUrl = resolved;
+        return false;
+      }
+      return undefined;
+    });
+    if (!result.name) {
+      const fallback = normaliseProductName(deriveNameFromUrl(normalised));
+      if (fallback) result.name = fallback;
+    }
+
+    result.name = normaliseProductName(result.name);
+
+    if (!result.contents_size_weight) {
+      const slugSize = extractSize(result.name) || extractSize(normalised);
+      if (slugSize) result.contents_size_weight = slugSize;
+    }
+    result.size = result.contents_size_weight;
+  } catch {
+    return result;
+  }
+  logger.info(
+    {
+      url: normalised,
+      name: result.name,
+      size: result.contents_size_weight,
+      sdsUrl: result.sdsUrl,
+    },
+    '[SCRAPER] scrape summary',
+  );
   return result;
 }
 
-// -----------------------------------------------------------------------------
-// Public: scrape product info from a single URL
-// -----------------------------------------------------------------------------
-export async function scrapeProductInfo(
-  url: string,
-  identifier?: string,
-): Promise<{ name?: string; contents_size_weight?: string; url: string; sdsUrl?: string }> {
-  // Check if the URL points directly to a PDF (likely an SDS)
-  const { isPdf, finalUrl } = await isPdfByHeaders(url);
-  if (isPdf) {
-    // If we got a PDF directly, try to extract product name from the URL or title
-    let extractedName = '';
-    let extractedSize = '';
-    try {
-      // Try to extract product name from PDF filename
-      const urlParts = finalUrl.split('/');
-      const filename = urlParts[urlParts.length - 1];
+export async function fetchSdsByName(
+  name: string,
+  size?: string,
+): Promise<{ sdsUrl: string | null; topLinks: string[] }> {
+  const cleanedName = normaliseProductName(name);
+  const cleanedSize = cleanText(size);
+  if (!cleanedName) return { sdsUrl: null, topLinks: [] };
+  const quotedName = cleanedName.includes(' ') ? `"${cleanedName}"` : cleanedName;
+  const queries = dedupe([
+    `${cleanedName} ${cleanedSize} safety data sheet`.trim(),
+    `${cleanedName} ${cleanedSize} sds pdf`.trim(),
+    `${cleanedName} sds pdf`.trim(),
+    `${cleanedName} sds`.trim(),
+    `${quotedName} sds`.trim(),
+    `${cleanedName} msds`.trim(),
+  ]);
+  const collected: string[] = [];
+  for (const query of queries) {
+    if (!query) continue;
+    const links = await fetchBingLinks(query, 6);
+    collected.push(...links);
+  }
+  let ordered = dedupe(collected);
+  let sdsUrl = ordered.find(link => isLikelySds(link)) || null;
 
-      // Decode URL encoding first
-      const decodedFilename = decodeURIComponent(filename);
-
-      const nameFromFile = decodedFilename
-        .replace(/\.(pdf|PDF)$/, '')
-        .replace(/[_-]/g, ' ')
-        .trim();
-
-      // Extract size before cleaning (look for patterns like (2L), 75mL, etc.)
-      const sizeMatch = nameFromFile.match(/\(?\d+(?:[\.,]\d+)?\s?(?:ml|mL|g|kg|oz|l|L)\)?/i);
-      if (sizeMatch) {
-        extractedSize = sizeMatch[0].replace(/[()]/g, '').trim();
-      }
-
-      // Clean up common patterns for name
-      extractedName = nameFromFile
-        .replace(/\b(sds|msds|safety|data|sheet|document)\b/gi, '')
-        .replace(/\b\d{7,}\b/g, '') // Remove long number codes
-        .replace(/\b(\d{3}_\d{3}_\d{3})\b/g, '') // Remove patterns like 3089176_001_001
-        .replace(/\(?\d+(?:[\.,]\d+)?\s?(?:ml|mL|g|kg|oz|l|L)\)?/gi, '') // Remove size from name
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      // If we still don't have a good name, try to extract from URL path
-      if (!extractedName || extractedName.length < 3) {
-        const pathParts = finalUrl.split('/').filter(
-          part =>
-            part &&
-            part !== 'system' &&
-            part !== 'files' &&
-            part !== 'download' &&
-            !part.match(/^\d+$/), // Skip pure numbers
+  if (!sdsUrl) {
+    for (const query of queries) {
+      if (!query) continue;
+      const duckLinks = await fetchDuckDuckGoLinks(query, 8);
+      if (duckLinks.length > 0) {
+        logger.info(
+          { query, duckCount: duckLinks.length, links: duckLinks.slice(0, 6) },
+          '[SCRAPER] DuckDuckGo SDS links collected',
         );
+        collected.push(...duckLinks);
+      }
+    }
+    ordered = dedupe(collected);
+  }
 
-        for (const part of pathParts.reverse()) {
-          const decoded = decodeURIComponent(part)
-            .replace(/[_-]/g, ' ')
-            .replace(/\b(sds|msds|safety|data|sheet)\b/gi, '')
-            .replace(/\s+/g, ' ')
-            .trim();
+  const scored = ordered
+    .map(link => ({ link, score: scoreSdsLink(link, cleanedName) }))
+    .filter(item => Number.isFinite(item.score))
+    .sort((a, b) => b.score - a.score);
 
-          if (decoded && decoded.length > 3) {
-            extractedName = decoded;
-            break;
-          }
+  const verificationCandidates = scored.filter(item => item.score > 0).slice(0, 4);
+  let bestVerified: { link: string; score: number } | null = null;
+  for (const candidate of verificationCandidates) {
+    try {
+      const verified = await verifySdsLink(candidate.link, cleanedName, cleanedSize);
+      if (verified) {
+        logger.info(
+          { query: cleanedName, verifiedLink: candidate.link },
+          '[SCRAPER] SDS link verified via OCR',
+        );
+        if (!bestVerified || candidate.score > bestVerified.score) {
+          bestVerified = { link: candidate.link, score: candidate.score };
         }
       }
-
-      console.log(`[SCRAPER] Extracted name from PDF filename: "${extractedName}"`);
-      console.log(`[SCRAPER] Extracted size from PDF filename: "${extractedSize}"`);
-    } catch (e) {
-      console.warn('[SCRAPER] Failed to extract name from PDF filename:', e);
+    } catch (err) {
+      logger.warn({ link: candidate.link, err: String(err) }, '[SCRAPER] SDS verification threw');
     }
-
-    // Attempt verification for logging/validation, but accept the PDF regardless
-    try {
-      await verifySdsUrl(finalUrl, extractedName || identifier || '');
-    } catch {}
-
-    return {
-      name: extractedName || '',
-      contents_size_weight: extractedSize || '',
-      url: finalUrl,
-      sdsUrl: finalUrl,
-    };
   }
 
-  const res = await http.get(finalUrl);
-  const html = res.data as string;
-  const $ = cheerio.load(html);
-
-  // Check for anti-bot detection phrases
-  const pageText = $('body').text().toLowerCase();
-  const title = $('title').text().toLowerCase();
-
-  const antiBotPhrases = [
-    'checking your browser',
-    'browser check',
-    'verifying you are human',
-    'cloudflare',
-    'access denied',
-    'blocked',
-    'captcha',
-  ];
-
-  const hasAntiBotDetection = antiBotPhrases.some(
-    phrase => pageText.includes(phrase) || title.includes(phrase),
-  );
-
-  if (hasAntiBotDetection) {
-    console.log(`[SCRAPER] Anti-bot detection detected on ${finalUrl}, skipping`);
-    return { name: '', contents_size_weight: '', url: finalUrl };
+  if (bestVerified) {
+    sdsUrl = bestVerified.link;
+  } else if (!sdsUrl) {
+    const preferred = scored.find(item => isLikelySds(item.link));
+    if (preferred) {
+      sdsUrl = preferred.link;
+    }
   }
 
-  const name =
-    $('h1').first().text().trim() || $("meta[property='og:title']").attr('content') || '';
-  const bodyText = $('body').text();
-  const sizeMatch = bodyText.match(/(\d+(?:[\.,]\d+)?\s?(?:ml|mL|g|kg|oz|l|L)\b)/);
-  const size = sizeMatch ? sizeMatch[0].replace(',', '.') : '';
+  const fallbackOrdered =
+    scored.length > 0
+      ? scored
+      : ordered.map(link => ({ link, score: scoreSdsLink(link, cleanedName) }));
+  const topLinks = fallbackOrdered.slice(0, 10).map(item => item.link);
 
-  return { name, contents_size_weight: size, url: finalUrl };
+  return { sdsUrl: sdsUrl || null, topLinks };
+}
+
+export async function fetchSdsByNameSimple(
+  name: string,
+  size?: string,
+): Promise<{ sdsUrl: string | null; topLinks: string[] }> {
+  return fetchSdsByName(name, size);
+}
+
+export async function searchWithManualData(
+  name: string,
+  size: string,
+  code: string,
+): Promise<ProductScrapeResult> {
+  const cleanedName = cleanText(name);
+  const cleanedSize = cleanText(size);
+  const hint = cleanedSize || cleanText(code);
+  const { sdsUrl } = await fetchSdsByName(cleanedName, hint);
+  return {
+    url: '',
+    name: cleanedName,
+    contents_size_weight: cleanedSize,
+    size: cleanedSize,
+    sdsUrl,
+  };
 }

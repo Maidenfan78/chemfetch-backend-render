@@ -38,10 +38,9 @@ function convertToISODate(dateString: string | null | undefined): string | null 
   }
 }
 
-// CRITICAL: Use the same environment variable preference as scraper.ts
-// Prefer backend-specific OCR URL, then fall back to Expo var for dev/mobile, then default
+// CRITICAL: Use the same environment variable as scraper.ts and render.yaml
 const OCR_SERVICE_URL =
-  process.env.OCR_SERVICE_URL || process.env.EXPO_PUBLIC_OCR_API_URL || 'http://127.0.0.1:5001';
+  process.env.EXPO_PUBLIC_OCR_API_URL || process.env.OCR_SERVICE_URL || 'http://127.0.0.1:5001';
 
 // Enhanced debugging for OCR service configuration
 console.log('[AUTO_SDS_DEBUG] ' + '='.repeat(30));
@@ -227,7 +226,7 @@ async function executeSdsParsing(productId: number, sdsUrl: string): Promise<voi
       hazardous_substance: parsedMetadata.hazardous_substance,
       dangerous_good: parsedMetadata.dangerous_good,
       dangerous_goods_class: parsedMetadata.dangerous_goods_class,
-      description: parsedMetadata.description,
+      description: parsedMetadata.product_name,
       packing_group: parsedMetadata.packing_group,
       subsidiary_risks: parsedMetadata.subsidiary_risks,
       raw_json: parsedMetadata.raw_json || parsedMetadata,
@@ -252,11 +251,8 @@ async function executeSdsParsing(productId: number, sdsUrl: string): Promise<voi
         dangerous_goods_class: parsedMetadata.dangerous_goods_class,
         packing_group: parsedMetadata.packing_group,
         subsidiary_risks: parsedMetadata.subsidiary_risks,
-        // Backfill missing item descriptions only
-        description: parsedMetadata.description || null,
       })
-      .eq('product_id', productId)
-      .is('description', null);
+      .eq('product_id', productId);
 
     logger.info(`Auto-SDS: Successfully parsed and stored metadata for product ${productId}`);
   } catch (error: any) {

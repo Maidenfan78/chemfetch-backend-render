@@ -1,4 +1,3 @@
-// server/routes/batchSds.ts
 import express from 'express';
 import { createServiceRoleClient } from '../utils/supabaseClient.js';
 import { triggerAutoSdsParsing, triggerBatchAutoSdsParsing } from '../utils/autoSdsParsing.js';
@@ -6,40 +5,28 @@ import logger from '../utils/logger.js';
 
 const router = express.Router();
 
-/**
- * POST /batch-sds/process-all
- * Process all products with SDS URLs that don't have metadata yet
- */
-router.post('/process-all', async (req, res) => {
+router.post('/process-all', async (_req, res) => {
   try {
-    logger.info('[BATCH-SDS] Starting batch processing of all pending products');
-
-    // Trigger batch processing (runs in background)
+    logger.info('[BATCH-SDS] Starting full processing');
     triggerBatchAutoSdsParsing();
-
     res.json({
       success: true,
       message: 'Batch SDS processing started in background',
     });
   } catch (error) {
-    logger.error({ error }, '[BATCH-SDS] Batch processing failed');
+    logger.error({ error }, '[BATCH-SDS] Failed to trigger batch processing');
     res.status(500).json({
       success: false,
       message: 'Failed to start batch processing',
-      error: (error as Error).message,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 });
 
-/**
- * POST /batch-sds/process-product
- * Process a specific product by ID
- * Body: { product_id: number, force?: boolean }
- */
 router.post('/process-product', async (req, res) => {
-  const { product_id, force = false } = req.body;
+  const { product_id, force = false } = req.body ?? {};
 
-  if (!product_id || typeof product_id !== 'number') {
+  if (typeof product_id !== 'number') {
     return res.status(400).json({
       success: false,
       message: 'product_id is required and must be a number',
@@ -47,10 +34,8 @@ router.post('/process-product', async (req, res) => {
   }
 
   try {
-    logger.info({ productId: product_id, force }, '[BATCH-SDS] Processing specific product');
-
-    const triggered = await triggerAutoSdsParsing(product_id, { force });
-
+    logger.info({ productId: product_id, force }, '[BATCH-SDS] Processing product');
+    const triggered = await triggerAutoSdsParsing(product_id, { force: Boolean(force) });
     if (triggered) {
       res.json({
         success: true,
@@ -60,60 +45,55 @@ router.post('/process-product', async (req, res) => {
     } else {
       res.json({
         success: false,
-        message: `No SDS parsing needed for product ${product_id} (no SDS URL or metadata already exists)`,
+        message: `No SDS parsing needed for product ${product_id}`,
         product_id,
       });
     }
   } catch (error) {
-    logger.error({ error, product_id }, `[BATCH-SDS] Failed to process product ${product_id}`);
+    logger.error({ error, product_id }, '[BATCH-SDS] Failed to process product');
     res.status(500).json({
       success: false,
       message: `Failed to process product ${product_id}`,
-      error: (error as Error).message,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 });
 
-/**
- * GET /batch-sds/status
- * Get statistics about SDS processing status
- */
-router.get('/status', async (req, res) => {
+router.get('/status', async (_req, res) => {
   try {
     const supabase = createServiceRoleClient();
 
-    // Get total products with SDS URLs
-    const { count: totalWithSds } = await supabase
+    const { count: totalWithSds = 0 } = await supabase
       .from('product')
       .select('*', { count: 'exact', head: true })
       .not('sds_url', 'is', null)
       .not('sds_url', 'eq', '');
 
-    // Get products with existing metadata
-    const { count: totalWithMetadata } = await supabase
+    const { count: totalWithMetadata = 0 } = await supabase
       .from('sds_metadata')
       .select('*', { count: 'exact', head: true });
 
-    // Get products needing processing
-    const { data: productsWithSds } = await supabase
+    const { data: productsWithSds = [] } = await supabase
       .from('product')
       .select('id')
       .not('sds_url', 'is', null)
       .not('sds_url', 'eq', '');
 
-    const { data: productsWithMetadata } = await supabase.from('sds_metadata').select('product_id');
+    const { data: productsWithMetadata = [] } = await supabase
+      .from('sds_metadata')
+      .select('product_id');
 
-    const processedIds = new Set(productsWithMetadata?.map(m => m.product_id) || []);
-    const pendingCount = (productsWithSds || []).filter(p => !processedIds.has(p.id)).length;
+    const processedIds = new Set((productsWithMetadata ?? []).map(row => row.product_id));
+    const pendingCount = (productsWithSds ?? []).filter(row => !processedIds.has(row.id)).length;
 
     res.json({
       success: true,
       statistics: {
-        total_products_with_sds: totalWithSds || 0,
-        total_with_metadata: totalWithMetadata || 0,
+        total_products_with_sds: totalWithSds,
+        total_with_metadata: totalWithMetadata,
         pending_processing: pendingCount,
         processing_rate: totalWithSds
-          ? Math.round(((totalWithMetadata || 0) / totalWithSds) * 100)
+          ? Math.round(((totalWithMetadata ?? 0) / totalWithSds) * 100)
           : 0,
       },
     });
@@ -122,7 +102,7 @@ router.get('/status', async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to get processing status',
-      error: (error as Error).message,
+      error: error instanceof Error ? error.message : String(error),
     });
   }
 });

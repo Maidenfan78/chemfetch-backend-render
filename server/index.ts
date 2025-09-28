@@ -10,7 +10,14 @@ import logger from './utils/logger.js';
 // ---------------------------------------------------------------------------
 app.get('/ocr/health', (_req, res) => res.json({ status: 'ok', target: '127.0.0.1:5001' }));
 
-// Health check handled via router in app.ts
+// Health check for Render
+app.get('/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV,
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 🏁  Start server

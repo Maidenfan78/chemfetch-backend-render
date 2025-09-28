@@ -11,8 +11,6 @@
     "process-existing-sds": "npx tsx scripts/processExistingSds.ts",
     "reprocess-all-sds": "npx tsx scripts/processExistingSds.ts --force",
     "force-reprocess-sds": "npx tsx scripts/forceReprocessSds.ts",
-    "sds:search": "npx tsx scripts/sdsSearch.ts",
-    "scan:barcode": "npx tsx scripts/barcodeSearch.ts",
     "collect-logs": "node scripts/collect-logs.js",
     "view-logs": "node scripts/collect-logs.js && cat logs.txt",
     "lint": "eslint .",

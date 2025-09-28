@@ -165,7 +165,7 @@ router.post('/', async (req, res) => {
       hazardous_substance: parsedData.hazardous_substance,
       dangerous_good: parsedData.dangerous_good,
       dangerous_goods_class: parsedData.dangerous_goods_class,
-      description: parsedData.description,
+      description: parsedData.product_name,
       packing_group: parsedData.packing_group,
       subsidiary_risks: parsedData.subsidiary_risks,
       raw_json: parsedData,
@@ -192,11 +192,8 @@ router.post('/', async (req, res) => {
         dangerous_goods_class: parsedData.dangerous_goods_class,
         packing_group: parsedData.packing_group,
         subsidiary_risks: parsedData.subsidiary_risks,
-        // Only fill missing user item descriptions
-        description: parsedData.description || null,
       })
-      .eq('product_id', product_id)
-      .is('description', null);
+      .eq('product_id', product_id);
 
     if (updateError) {
       logger.warn({ error: updateError }, 'Failed to update user watch lists');
@@ -259,7 +256,6 @@ function transformToChemfetchFormat(
     product_name: getValue('product_name') || productName,
     vendor: getValue('manufacturer'),
     issue_date: getValue('issue_date'),
-    description: getValue('description'),
     hazardous_substance: isHazardous,
     dangerous_good: isDangerousGood,
     dangerous_goods_class: dangerousGoodsClass,
