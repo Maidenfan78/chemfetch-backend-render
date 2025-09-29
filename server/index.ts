@@ -8,7 +8,8 @@ import logger from './utils/logger.js';
 // ---------------------------------------------------------------------------
 // 🩺  Health check (verifies proxy path)
 // ---------------------------------------------------------------------------
-app.get('/ocr/health', (_req, res) => res.json({ status: 'ok', target: '127.0.0.1:5001' }));
+const ocrServiceUrl = process.env.OCR_SERVICE_URL || process.env.EXPO_PUBLIC_OCR_API_URL || 'http://127.0.0.1:5001';
+app.get('/ocr/health', (_req, res) => res.json({ status: 'ok', target: ocrServiceUrl }));
 
 // Health check for Render
 app.get('/health', (_req, res) => {
