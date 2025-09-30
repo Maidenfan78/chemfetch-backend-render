@@ -398,42 +398,76 @@ function deriveNameFromUrl(url: string): string {
 async function fetchDuckDuckGoLinks(query: string, limit = 6): Promise<string[]> {
   const trimmed = cleanText(query);
   if (!trimmed) return [];
-  try {
-    const searchUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}`;
-    const { data } = await httpGet(searchUrl);
-    const $ = cheerio.load(data);
-    const links: string[] = [];
-    $('a.result__a[href]').each((_, el) => {
-      const raw = $(el).attr('href');
-      const normalised = normaliseLink(raw, searchUrl);
-      if (normalised) {
-        links.push(normalised);
-        if (links.length >= limit * 2) return false;
+  const attempts = [
+    {
+      name: 'DuckDuckGo HTML',
+      url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmed)}&ia=web`,
+      selectors: ['a.result__a[href]'],
+    },
+    {
+      name: 'DuckDuckGo Lite',
+      url: `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(trimmed)}&ia=web`,
+      selectors: ['a.result-link[href]'],
+    },
+  ];
+  const errors: string[] = [];
+  for (const attempt of attempts) {
+    try {
+      const { data } = await httpGet(attempt.url, { Referer: 'https://duckduckgo.com/' });
+      const $ = cheerio.load(data);
+      const links: string[] = [];
+      for (const selector of attempt.selectors) {
+        $(selector.trim()).each((_, el) => {
+          const raw = $(el).attr('href');
+          const normalised = normaliseLink(raw, attempt.url);
+          if (normalised) {
+            links.push(normalised);
+            if (links.length >= limit * 2) return false;
+          }
+          return undefined;
+        });
+        if (links.length >= limit * 2) break;
       }
-      return undefined;
-    });
-    const deduped = dedupe(links);
-    logger.info(
-      { query: trimmed, linkCount: deduped.length, links: deduped.slice(0, limit) },
-      '[SCRAPER] DuckDuckGo links collected',
-    );
-    return deduped.slice(0, limit);
-  } catch (err) {
-    logger.warn({ query: trimmed, err: String(err) }, '[SCRAPER] DuckDuckGo search failed');
-    return [];
+      const deduped = dedupe(links);
+      if (deduped.length > 0) {
+        logger.info(
+          {
+            query: trimmed,
+            linkCount: deduped.length,
+            links: deduped.slice(0, limit),
+            source: attempt.name,
+          },
+          '[SCRAPER] DuckDuckGo links collected',
+        );
+        return deduped.slice(0, limit);
+      }
+      errors.push(`${attempt.name} returned no links`);
+    } catch (err) {
+      errors.push(`${attempt.name}: ${String(err)}`);
+    }
   }
+  logger.warn(
+    { query: trimmed, err: errors.join('; ') || 'No results' },
+    '[SCRAPER] DuckDuckGo search failed',
+  );
+  return [];
 }
-
-async function httpGet(url: string) {
+async function httpGet(url: string, extraHeaders: Record<string, string | undefined> = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
   try {
+    const headers: Record<string, string> = {
+      'User-Agent': USER_AGENT,
+      'Accept-Language': 'en-AU,en;q=0.9',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    };
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      if (typeof value === 'string' && value.trim()) {
+        headers[key] = value;
+      }
+    }
     const response = await fetch(url, {
-      headers: {
-        'User-Agent': USER_AGENT,
-        'Accept-Language': 'en-AU,en;q=0.9',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
+      headers,
       redirect: 'follow',
       signal: controller.signal,
     });
@@ -451,7 +485,6 @@ async function httpGet(url: string) {
     clearTimeout(timeout);
   }
 }
-
 function hasUsefulHost(links: string[]): boolean {
   return links.some(link => {
     const host = getHostname(link);
@@ -466,19 +499,14 @@ export async function fetchBingLinks(query: string, limit = 6): Promise<string[]
   const trimmed = cleanText(query);
   if (!trimmed) return [];
   try {
-    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(trimmed)}&setlang=en-US`;
-    const { data } = await httpGet(searchUrl);
-    const $ = cheerio.load(data);
-    const links: string[] = [];
-    'li.b_algo h2 a, li.b_algo a.title'.split(',').forEach(selector => {
-      $(selector.trim()).each((_, el) => {
-        const raw = $(el).attr('href');
-        const normalised = normaliseLink(raw);
-        if (normalised) links.push(normalised);
-      });
+    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(trimmed)}&setlang=en-US&format=rss`;
+    const { data } = await httpGet(searchUrl, {
+      Accept: 'application/rss+xml,application/xml;q=0.9,text/xml;q=0.8,*/*;q=0.7',
     });
-    $('a[href^=https://www.bing.com/ck/a]').each((_, el) => {
-      const raw = $(el).attr('href');
+    const $ = cheerio.load(data, { xmlMode: true });
+    const links: string[] = [];
+    $('item > link').each((_, el) => {
+      const raw = $(el).text();
       const normalised = normaliseLink(raw);
       if (normalised) links.push(normalised);
     });
@@ -499,12 +527,11 @@ export async function fetchBingLinks(query: string, limit = 6): Promise<string[]
       }
     }
     return deduped.slice(0, limit);
-  } catch {
-    logger.warn({ query: trimmed }, '[SCRAPER] Bing search failed');
+  } catch (err) {
+    logger.warn({ query: trimmed, err: String(err) }, '[SCRAPER] Bing search failed');
     return [];
   }
 }
-
 export async function expandSiteSearchPage(url: string, limit = 5): Promise<string[]> {
   const normalised = normaliseLink(url);
   if (!normalised) return [];
